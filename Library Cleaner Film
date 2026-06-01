@@ -1,0 +1,522 @@
+#!/bin/bash
+# ============================================================
+#  Subtitle + Trickplay Renamer for Radarr Movie Folders
+#  (Unraid UserScripts)
+# ============================================================
+#  Walks a film library and, for each movie folder, determines
+#  the "main" video (largest video file in that folder) and:
+#
+#    1. Renames sibling subtitles  (srt/sub/ass/ssa/vtt/idx/sup)
+#       to match the video's base name, PRESERVING the subtitle's
+#       language code and any trailing flags like .hi .sdh .cc
+#       .forced .default .foreign.
+#
+#    2. Renames sibling ".trickplay" folders so they are named
+#       "<video_full_filename>.trickplay" (the Jellyfin/Emby
+#       convention is "movie.mkv.trickplay").
+#
+#  Subtitle example:
+#    Video: Film (2020)-Radarr.mkv
+#    Sub:   Film (2020) [Bluray]{imdb-tt123}{tmdb-456}-Radarr.ar.hi.srt
+#    -->    Film (2020)-Radarr.ar.hi.srt
+#
+#  Trickplay example:
+#    Video:     Film (2020)-Radarr.mkv
+#    Trickplay: Film (2020) [old name].mkv.trickplay
+#    -->        Film (2020)-Radarr.mkv.trickplay
+# ============================================================
+
+# --------------------- CONFIGURATION ------------------------
+
+ROOT_DIR="/mnt/user/Media-Large/Films"
+
+# IMPORTANT: Leave DRY_RUN="true" for the first run. Inspect the
+# log, then flip to "false" to perform the actual renames.
+DRY_RUN="true"
+
+# Set to "false" to disable ALL logging (file + console output).
+# The script will still run and perform renames silently.
+ENABLE_LOG="true"
+
+# Log file - pick any writable path. Appended to each run.
+# Ignored when ENABLE_LOG="false".
+LOG_FILE="/mnt/user/appdata/subtitle_renamer/rename.log"
+
+# File extensions we treat as video (main movie) files.
+VIDEO_EXTS=(mkv mp4 avi m4v mov mpg mpeg wmv flv webm ts m2ts)
+
+# File extensions we treat as subtitle files.
+SUB_EXTS=(srt sub ass ssa vtt idx sup)
+
+# Subtitle "flag" suffixes that come after a language code.
+KNOWN_FLAGS=(hi sdh cc forced default foreign cc1 cc2)
+
+# Maximum number of trailing dot-components we'll peel off a
+# subtitle filename to build the language/flag suffix.
+MAX_SUFFIX_PARTS=3
+
+# When "true", strip a trailing ".hi" (hearing-impaired flag) from
+# subtitle names — but ONLY when another language/flag component
+# precedes it. A lone ".hi" is preserved because it may be the
+# Hindi language code.
+#   ...en.hi.srt  -> ...en.srt     (stripped)
+#   ...ar.hi.srt  -> ...ar.srt     (stripped)
+#   ...hi.srt     -> ...hi.srt     (kept - possibly Hindi)
+STRIP_HI="false"
+
+# DESTRUCTIVE. When "true", subtitle files whose containing folder
+# has no video file at all are DELETED. Honors DRY_RUN — nothing is
+# removed in dry-run mode. Leave "false" unless you've reviewed at
+# least one dry-run log and trust the result.
+DELETE_ORPHANS="false"
+
+# DESTRUCTIVE. When "true", subtitle files whose name is malformed
+# in one of the patterns below are DELETED instead of being
+# renamed. Honors DRY_RUN. Detects:
+#   1. A numeric component just before the lang/flag suffix:
+#        ...Radarr.3.hi.srt   ...Radarr.7.hi.srt
+#      (typically junk left over from audio-track-ID parsing)
+#   2. Duplicate components in the peeled suffix:
+#        ...Radarr.hi.hi.srt   ...Radarr.en.en.srt
+DELETE_OUTLIERS="false"
+
+# DESTRUCTIVE. When "true", any .nfo file in a movie folder whose
+# basename does NOT match any video's basename in the same folder
+# (and isn't the alternate "movie.nfo" convention) is DELETED.
+# Honors DRY_RUN. Useful for clearing out stale .nfo files left
+# behind from prior video renames.
+DELETE_OUTLIER_NFO="false"
+
+# DESTRUCTIVE. When "true", a subtitle whose rename target ALREADY
+# EXISTS (currently logged as [SUB SKIP exists]) is DELETED instead
+# of being left in place. The pre-existing file at the target path
+# is kept untouched. Honors DRY_RUN.
+#   Example: two subs both want to become ...Radarr.hi.srt - the
+#   first wins the rename, the second (which would have been
+#   skipped) is deleted as a duplicate.
+DELETE_DUPLICATES="false"
+
+# --------------------- END CONFIGURATION --------------------
+
+set -u
+
+if [ "$ENABLE_LOG" = "true" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    log() {
+        echo "$@" | tee -a "$LOG_FILE"
+    }
+else
+    log() { :; }
+fi
+
+log "=========================================================="
+log " Subtitle + Trickplay Renamer: $(date '+%Y-%m-%d %H:%M:%S')"
+log " Root:    $ROOT_DIR"
+log " Dry-run: $DRY_RUN"
+log "=========================================================="
+
+if [ ! -d "$ROOT_DIR" ]; then
+    log "ERROR: ROOT_DIR does not exist: $ROOT_DIR"
+    exit 1
+fi
+
+# Build flag regex for is_suffix_component().
+FLAG_RE=""
+for f in "${KNOWN_FLAGS[@]}"; do FLAG_RE+="|$f"; done
+FLAG_RE="${FLAG_RE:1}"
+
+# Returns 0 if $1 looks like a language code or known flag.
+# Accepts 2-3 letter codes, optional -xx(xx) locale suffix
+# (e.g. pt-br, zh-cn), and any flag from KNOWN_FLAGS.
+is_suffix_component() {
+    local c="${1,,}"
+    [[ "$c" =~ ^[a-z]{2,3}(-[a-z0-9]{2,4})?$ ]] && return 0
+    [[ "$c" =~ ^($FLAG_RE)$ ]] && return 0
+    return 1
+}
+
+# Portable "file size in bytes". Unraid is Linux (GNU stat).
+file_size() {
+    stat -c%s -- "$1" 2>/dev/null || stat -f%z -- "$1" 2>/dev/null || echo 0
+}
+
+# ---------- PASS 1: collect main video per folder -----------
+# For each folder that contains any video file, remember the
+# largest one (this is almost always the feature film, not a
+# trailer/featurette).
+declare -A MAIN_VIDEO
+declare -A MAIN_SIZE
+declare -A VIDEO_COUNT
+
+# Build a case-insensitive find expression matching all video exts.
+find_args=(-type f \()
+first=1
+for ext in "${VIDEO_EXTS[@]}"; do
+    if [ $first -eq 1 ]; then
+        find_args+=(-iname "*.$ext"); first=0
+    else
+        find_args+=(-o -iname "*.$ext")
+    fi
+done
+find_args+=(\) -print0)
+
+while IFS= read -r -d '' video; do
+    folder="$(dirname "$video")"
+    VIDEO_COUNT["$folder"]=$(( ${VIDEO_COUNT["$folder"]:-0} + 1 ))
+    size="$(file_size "$video")"
+    current="${MAIN_SIZE[$folder]:-0}"
+    if [ "$size" -gt "$current" ]; then
+        MAIN_SIZE["$folder"]="$size"
+        MAIN_VIDEO["$folder"]="$video"
+    fi
+done < <(find "$ROOT_DIR" "${find_args[@]}")
+
+# ---------- PASS 2: process each folder exactly once --------
+folder_count=0
+sub_rename=0
+sub_skip_noop=0
+sub_skip_exists=0
+tp_rename=0
+tp_skip_noop=0
+tp_skip_exists=0
+tp_skip_ambig=0
+orphan_delete=0
+outlier_delete=0
+nfo_outlier_delete=0
+duplicate_delete=0
+error_count=0
+
+# Helper: delete a malformed subtitle (or dry-run log it).
+delete_outlier_sub() {
+    local sub="$1" reason="$2"
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[OUTLIER DRY-RUN delete - $reason] $sub"
+        outlier_delete=$((outlier_delete + 1))
+    else
+        if rm -- "$sub"; then
+            log "[OUTLIER DELETED - $reason] $sub"
+            outlier_delete=$((outlier_delete + 1))
+        else
+            log "[OUTLIER ERROR - $reason] $sub"
+            error_count=$((error_count + 1))
+        fi
+    fi
+}
+
+for folder in "${!MAIN_VIDEO[@]}"; do
+    folder_count=$((folder_count + 1))
+    main_video="${MAIN_VIDEO[$folder]}"
+    main_basename="$(basename "$main_video")"    # e.g. movie.mkv
+    main_name="${main_basename%.*}"              # e.g. movie
+    vcount="${VIDEO_COUNT[$folder]}"
+
+    # ------------------ SUBTITLES ---------------------------
+    shopt -s nullglob nocaseglob
+    subs=()
+    for ext in "${SUB_EXTS[@]}"; do
+        for s in "$folder"/*."$ext"; do
+            subs+=("$s")
+        done
+    done
+    shopt -u nullglob nocaseglob
+
+    for sub in "${subs[@]}"; do
+        sub_basename="$(basename "$sub")"
+        sub_ext="${sub_basename##*.}"
+        name_no_ext="${sub_basename%.*}"
+
+        # Peel trailing language / flag components into an array
+        # so we can inspect them (needed for STRIP_HI logic).
+        components=()
+        remainder="$name_no_ext"
+        for ((i = 0; i < MAX_SUFFIX_PARTS; i++)); do
+            [[ "$remainder" == *.* ]] || break
+            last="${remainder##*.}"
+            if is_suffix_component "$last"; then
+                components=("${last,,}" "${components[@]}")
+                remainder="${remainder%.*}"
+            else
+                break
+            fi
+        done
+
+        # ---- Outlier detection -----------------------------
+        # 1. Remainder ends in a digit-only token (e.g. .3.hi.srt
+        #    where the .3 is junk from old audio-track parsing).
+        # 2. Peeled components contain a duplicate (e.g. .hi.hi).
+        outlier_reason=""
+        if [[ "$remainder" == *.* ]]; then
+            trailing="${remainder##*.}"
+            if [[ "$trailing" =~ ^[0-9]+$ ]]; then
+                outlier_reason="trailing numeric '.$trailing'"
+            fi
+        fi
+        if [ -z "$outlier_reason" ] && [ ${#components[@]} -ge 2 ]; then
+            declare -A seen_comp=()
+            for c in "${components[@]}"; do
+                if [ -n "${seen_comp[$c]:-}" ]; then
+                    outlier_reason="duplicate suffix '.$c'"
+                    break
+                fi
+                seen_comp["$c"]=1
+            done
+            unset seen_comp
+        fi
+
+        if [ -n "$outlier_reason" ]; then
+            if [ "$DELETE_OUTLIERS" = "true" ]; then
+                delete_outlier_sub "$sub" "$outlier_reason"
+                continue
+            else
+                log "[SUB OUTLIER ($outlier_reason)] $sub"
+            fi
+        fi
+        # ----------------------------------------------------
+
+        # Optionally strip a trailing ".hi" - but only when another
+        # component precedes it, so a lone ".hi" (Hindi) is kept.
+        if [ "$STRIP_HI" = "true" ] \
+           && [ ${#components[@]} -gt 1 ] \
+           && [ "${components[-1]}" = "hi" ]; then
+            unset 'components[-1]'
+        fi
+
+        suffix=""
+        for c in "${components[@]}"; do
+            suffix+=".$c"
+        done
+
+        new_name="${main_name}${suffix}.${sub_ext,,}"
+        new_path="$folder/$new_name"
+
+        if [ "$sub_basename" = "$new_name" ]; then
+            sub_skip_noop=$((sub_skip_noop + 1))
+            continue
+        fi
+        if [ -e "$new_path" ]; then
+            if [ "$DELETE_DUPLICATES" = "true" ]; then
+                if [ "$DRY_RUN" = "true" ]; then
+                    log "[SUB DUP DRY-RUN delete] $sub"
+                    log "                target:  $new_path"
+                    duplicate_delete=$((duplicate_delete + 1))
+                else
+                    if rm -- "$sub"; then
+                        log "[SUB DUP DELETED] $sub"
+                        duplicate_delete=$((duplicate_delete + 1))
+                    else
+                        log "[SUB DUP ERROR] Failed to delete: $sub"
+                        error_count=$((error_count + 1))
+                    fi
+                fi
+            else
+                log "[SUB SKIP exists] $sub"
+                log "             -->  $new_path"
+                sub_skip_exists=$((sub_skip_exists + 1))
+            fi
+            continue
+        fi
+
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[SUB DRY-RUN] $sub"
+            log "         -->  $new_path"
+            sub_rename=$((sub_rename + 1))
+        else
+            if mv -n -- "$sub" "$new_path"; then
+                log "[SUB RENAMED] $sub_basename"
+                log "         -->  $new_name"
+                sub_rename=$((sub_rename + 1))
+            else
+                log "[SUB ERROR] Failed to rename: $sub"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done
+
+    # ------------------ TRICKPLAY FOLDERS -------------------
+    shopt -s nullglob
+    trickplays=("$folder"/*.trickplay)
+    shopt -u nullglob
+
+    for tp in "${trickplays[@]}"; do
+        [ -d "$tp" ] || continue
+        tp_basename="$(basename "$tp")"
+        expected_tp="${main_name}.trickplay"
+        target_path="$folder/$expected_tp"
+
+        # Already correctly named.
+        if [ "$tp_basename" = "$expected_tp" ]; then
+            tp_skip_noop=$((tp_skip_noop + 1))
+            continue
+        fi
+
+        # Trickplay still matches some OTHER existing video in
+        # this folder (e.g. "Featurette.trickplay" alongside
+        # "Featurette.mkv"). Leave it alone.
+        linked_base="${tp_basename%.trickplay}"
+        linked_paired=0
+        shopt -s nullglob nocaseglob
+        for vext in "${VIDEO_EXTS[@]}"; do
+            if [ -e "$folder/${linked_base}.$vext" ]; then
+                linked_paired=1
+                break
+            fi
+        done
+        shopt -u nullglob nocaseglob
+        if [ $linked_paired -eq 1 ]; then
+            tp_skip_noop=$((tp_skip_noop + 1))
+            continue
+        fi
+
+        # Ambiguous: multiple videos in folder and this orphan
+        # trickplay could belong to any of them.
+        if [ "$vcount" -gt 1 ]; then
+            log "[TP SKIP ambiguous - folder has $vcount videos] $tp"
+            tp_skip_ambig=$((tp_skip_ambig + 1))
+            continue
+        fi
+
+        if [ -e "$target_path" ]; then
+            log "[TP SKIP exists] $tp"
+            log "            -->  $target_path"
+            tp_skip_exists=$((tp_skip_exists + 1))
+            continue
+        fi
+
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[TP DRY-RUN] $tp"
+            log "        -->  $target_path"
+            tp_rename=$((tp_rename + 1))
+        else
+            if mv -n -- "$tp" "$target_path"; then
+                log "[TP RENAMED] $tp_basename"
+                log "        -->  $expected_tp"
+                tp_rename=$((tp_rename + 1))
+            else
+                log "[TP ERROR] Failed to rename: $tp"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done
+
+    # ------------------ OUTLIER .NFO ------------------------
+    # Build the set of valid .nfo names: <video_base>.nfo for
+    # every video in the folder, plus the alternate "movie.nfo"
+    # convention. Anything else is a stale leftover.
+    if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
+        declare -A valid_nfo=( ["movie.nfo"]=1 )
+        shopt -s nullglob nocaseglob
+        for ext in "${VIDEO_EXTS[@]}"; do
+            for v in "$folder"/*."$ext"; do
+                [ -f "$v" ] || continue
+                vbase="$(basename "$v")"
+                key="${vbase%.*}.nfo"
+                valid_nfo["${key,,}"]=1
+            done
+        done
+
+        for nfo in "$folder"/*.nfo; do
+            [ -f "$nfo" ] || continue
+            nfo_name="$(basename "$nfo")"
+            if [ -n "${valid_nfo[${nfo_name,,}]:-}" ]; then
+                continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+                log "[NFO OUTLIER DRY-RUN delete] $nfo"
+                nfo_outlier_delete=$((nfo_outlier_delete + 1))
+            else
+                if rm -- "$nfo"; then
+                    log "[NFO OUTLIER DELETED] $nfo"
+                    nfo_outlier_delete=$((nfo_outlier_delete + 1))
+                else
+                    log "[NFO OUTLIER ERROR] $nfo"
+                    error_count=$((error_count + 1))
+                fi
+            fi
+        done
+        shopt -u nullglob nocaseglob
+        unset valid_nfo
+    fi
+done
+
+# ---------- PASS 3: delete orphaned subtitles ---------------
+# A subtitle is considered orphaned if its containing folder has
+# no video file at all (i.e. the folder is not in MAIN_VIDEO).
+if [ "$DELETE_ORPHANS" = "true" ]; then
+    log " ---- Orphan subtitle deletion pass ----"
+    sub_find_args=(-type f \()
+    first=1
+    for ext in "${SUB_EXTS[@]}"; do
+        if [ $first -eq 1 ]; then
+            sub_find_args+=(-iname "*.$ext"); first=0
+        else
+            sub_find_args+=(-o -iname "*.$ext")
+        fi
+    done
+    sub_find_args+=(\) -print0)
+
+    while IFS= read -r -d '' sub; do
+        folder="$(dirname "$sub")"
+        # If folder is in MAIN_VIDEO, the sub is owned by a video.
+        [ -n "${MAIN_VIDEO[$folder]:-}" ] && continue
+
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[ORPHAN DRY-RUN delete] $sub"
+            orphan_delete=$((orphan_delete + 1))
+        else
+            if rm -- "$sub"; then
+                log "[ORPHAN DELETED] $sub"
+                orphan_delete=$((orphan_delete + 1))
+            else
+                log "[ORPHAN ERROR] Failed to delete: $sub"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done < <(find "$ROOT_DIR" "${sub_find_args[@]}")
+fi
+
+log "=========================================================="
+log " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
+log " Folders processed:              $folder_count"
+if [ "$DRY_RUN" = "true" ]; then
+    log " Subtitles would rename:         $sub_rename"
+    log " Trickplay would rename:         $tp_rename"
+else
+    log " Subtitles renamed:              $sub_rename"
+    log " Trickplay folders renamed:      $tp_rename"
+fi
+log " Subtitles already correct:      $sub_skip_noop"
+log " Subtitles skipped (exists):     $sub_skip_exists"
+log " Trickplay already correct:      $tp_skip_noop"
+log " Trickplay skipped (exists):     $tp_skip_exists"
+log " Trickplay skipped (ambiguous):  $tp_skip_ambig"
+if [ "$DELETE_ORPHANS" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Orphan subs would delete:       $orphan_delete"
+    else
+        log " Orphan subs deleted:            $orphan_delete"
+    fi
+fi
+if [ "$DELETE_OUTLIERS" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Outlier subs would delete:      $outlier_delete"
+    else
+        log " Outlier subs deleted:           $outlier_delete"
+    fi
+fi
+if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Outlier .nfo would delete:      $nfo_outlier_delete"
+    else
+        log " Outlier .nfo deleted:           $nfo_outlier_delete"
+    fi
+fi
+if [ "$DELETE_DUPLICATES" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Duplicate subs would delete:    $duplicate_delete"
+    else
+        log " Duplicate subs deleted:         $duplicate_delete"
+    fi
+fi
+log " Errors:                         $error_count"
+log "=========================================================="
