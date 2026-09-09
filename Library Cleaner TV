@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  Subtitle + Trickplay Renamer for Sonarr TV Show Folders
-#  (Unraid UserScripts)
+#  Library Cleaner - TV  (Unraid UserScripts)
 # ============================================================
 #  TV layout assumed:
 #    <ROOT>/<Show (Year) [tvdbid-XXX]>/Season NN/<episode files>
@@ -19,16 +18,32 @@
 #         - Rename to <episode_video_base><suffix>.<ext>
 #    3. For every <name>.trickplay folder:
 #         - Extract its SxxExx token
-#         - Rename to <episode_video_full_name>.trickplay
+#         - Rename to
+#           <episode_video_basename_without_extension>.trickplay
+#    4. Optionally clear out leftovers: orphaned subtitles,
+#       malformed subtitles, duplicate subtitles, stale .nfo
+#       files, stale artwork, junk files and empty folders.
+#       Every deletion is opt-in and honours DRY_RUN.
 #
 #  Multi-episode files (Show - S01E01-E02 - Title.mkv) are keyed
 #  by their FIRST SxxExx token; their subtitles/trickplay are
 #  expected to share that token.
+#
+#  Trickplay example:
+#    Video:     Show - S01E01 - Title.mkv
+#    Trickplay: Show - S01E01 - Old Title.trickplay
+#    -->        Show - S01E01 - Title.trickplay
 # ============================================================
 
 # --------------------- CONFIGURATION ------------------------
 
-ROOT_DIR="/mnt/user/Media-Large/TV Shows/[2160p, MN]"
+# One or more library roots to scan. Each is walked
+# independently; a path that does not exist is reported and
+# skipped. Add as many lines as you like.
+ROOT_DIRS=(
+    "/mnt/user/Media-Large/TV Shows/[2160p, MN]"
+    #"/mnt/user/Media-Large/TV Shows/[1080p]"
+)
 
 # Leave DRY_RUN="true" for the first run. Inspect log, then flip.
 DRY_RUN="true"
@@ -42,6 +57,7 @@ LOG_FILE="/mnt/user/appdata/subtitle_renamer/rename_tv.log"
 
 VIDEO_EXTS=(mkv mp4 avi m4v mov mpg mpeg wmv flv webm ts m2ts)
 SUB_EXTS=(srt sub ass ssa vtt idx sup)
+ART_EXTS=(jpg jpeg png webp tbn bmp)
 KNOWN_FLAGS=(hi sdh cc forced default foreign cc1 cc2)
 MAX_SUFFIX_PARTS=3
 
@@ -82,30 +98,105 @@ DELETE_OUTLIERS="false"
 # not a season folder, so it's untouched by this script.)
 DELETE_OUTLIER_NFO="false"
 
+# DESTRUCTIVE. When "true", image files in a season folder that
+# don't correspond to any episode there are DELETED. Honors
+# DRY_RUN. An image is KEPT when it is:
+#   - a generic artwork name        (poster.jpg, fanart2.jpg, ...)
+#   - a season artwork name         (season01-poster.jpg, ...)
+#   - "<episode basename>.<ext>"    (Kodi thumb convention)
+#   - "<episode basename>-<arttype>"
+# Anything else is treated as a leftover from a prior rename.
+DELETE_OUTLIER_ART="false"
+
+# DESTRUCTIVE. When "true", files matching JUNK_GLOBS anywhere
+# under the roots are DELETED. Honors DRY_RUN. This runs as its
+# own sweep, so it also reaches show roots and non-season folders.
+DELETE_JUNK="false"
+
+# DESTRUCTIVE. When "true", empty folders under the roots are
+# removed after all other passes (so folders emptied by this run
+# are caught too). Nested empties collapse: the pass repeats
+# until nothing more can be removed. The roots themselves are
+# never removed. Honors DRY_RUN.
+PRUNE_EMPTY_DIRS="false"
+
 # Only descend into folders matching this regex. Sonarr always
 # uses "Season NN" (and "Specials" for Season 00). Set to an
 # empty string to scan every subfolder of every show.
 SEASON_DIR_REGEX='^(Season[ _.-]?[0-9]+|Specials)$'
 
+# Generic artwork basenames, used by DELETE_OUTLIER_ART. A
+# trailing number is allowed automatically (fanart2, backdrop3).
+GENERIC_ART_NAMES=(
+    poster folder cover fanart backdrop background banner thumb
+    landscape logo clearart clearlogo disc discart cdart keyart
+    characterart art extrafanart
+)
+
+# Artwork type suffixes that may follow an episode basename, used
+# by DELETE_OUTLIER_ART. A trailing number is allowed
+# automatically.
+ART_SUFFIXES=(
+    poster fanart backdrop banner thumb landscape logo clearart
+    clearlogo disc discart cdart keyart
+)
+
+# Season-level artwork names kept by DELETE_OUTLIER_ART, e.g.
+# season01-poster.jpg, season-specials-banner.jpg,
+# season-all-poster.jpg.
+SEASON_ART_RE='^season([0-9]+|-all|-specials)?-(poster|banner|fanart|backdrop|landscape|thumb|logo|clearart|clearlogo|keyart)[0-9]*$'
+
+# Junk filename patterns, used by DELETE_JUNK. Matched
+# case-insensitively against the filename only.
+JUNK_GLOBS=(
+    '.DS_Store' '._*' 'Thumbs.db' 'ehthumbs.db' 'desktop.ini'
+    '*.url' '*.sfv' '*.nzb' '*.torrent' '*.md5' 'RARBG*.txt'
+)
+
 # --------------------- END CONFIGURATION --------------------
 
-set -u
+set -uo pipefail
 
+# ---------- Logging -----------------------------------------
+# One append-mode file descriptor opened once, rather than a
+# `tee` fork per line. Falls back to console-only if the log
+# path can't be written.
 if [ "$ENABLE_LOG" = "true" ]; then
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-    log() { echo "$@" | tee -a "$LOG_FILE"; }
+    if : >>"$LOG_FILE" 2>/dev/null; then
+        exec {LOG_FD}>>"$LOG_FILE"
+        log() {
+            printf '%s\n' "$*"
+            printf '%s\n' "$*" >&$LOG_FD
+        }
+    else
+        echo "WARNING: cannot write $LOG_FILE - logging to console only" >&2
+        log() { printf '%s\n' "$*"; }
+    fi
 else
     log() { :; }
 fi
 
 log "=========================================================="
-log " TV Subtitle + Trickplay Renamer: $(date '+%Y-%m-%d %H:%M:%S')"
-log " Root:    $ROOT_DIR"
+log " Library Cleaner - TV: $(date '+%Y-%m-%d %H:%M:%S')"
 log " Dry-run: $DRY_RUN"
+
+# ---------- Validate roots ----------------------------------
+ROOTS=()
+if [ "${#ROOT_DIRS[@]}" -gt 0 ]; then
+    for r in "${ROOT_DIRS[@]}"; do
+        if [ -d "$r" ]; then
+            ROOTS+=("$r")
+            log " Root:    $r"
+        else
+            log " WARNING: root does not exist, skipping: $r"
+        fi
+    done
+fi
 log "=========================================================="
 
-if [ ! -d "$ROOT_DIR" ]; then
-    log "ERROR: ROOT_DIR does not exist: $ROOT_DIR"
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+    log "ERROR: none of the configured ROOT_DIRS exist. Nothing to do."
     exit 1
 fi
 
@@ -114,10 +205,38 @@ FLAG_RE=""
 for f in "${KNOWN_FLAGS[@]}"; do FLAG_RE+="|$f"; done
 FLAG_RE="${FLAG_RE:1}"
 
+# Build artwork regexes for art_is_valid().
+GENERIC_ART_RE=""
+for n in "${GENERIC_ART_NAMES[@]}"; do GENERIC_ART_RE+="|$n"; done
+GENERIC_ART_RE="^(${GENERIC_ART_RE:1})[0-9]*$"
+
+ART_SUFFIX_RE=""
+for n in "${ART_SUFFIXES[@]}"; do ART_SUFFIX_RE+="|$n"; done
+ART_SUFFIX_RE="^(${ART_SUFFIX_RE:1})[0-9]*$"
+
 is_suffix_component() {
     local c="${1,,}"
     [[ "$c" =~ ^[a-z]{2,3}(-[a-z0-9]{2,4})?$ ]] && return 0
     [[ "$c" =~ ^($FLAG_RE)$ ]] && return 0
+    return 1
+}
+
+# Returns 0 if the lowercase image basename in $1 belongs to this
+# season folder's media. Reads the folder-local `vid_bases` map.
+art_is_valid() {
+    local base="$1" candidate suffix
+    [[ "$base" =~ $GENERIC_ART_RE ]] && return 0
+    [[ "$base" =~ $SEASON_ART_RE ]] && return 0
+    [ -n "${vid_bases[$base]:-}" ] && return 0
+    candidate="$base"
+    while [[ "$candidate" == *-* ]]; do
+        suffix="${candidate##*-}"
+        candidate="${candidate%-*}"
+        if [ -n "${vid_bases[$candidate]:-}" ] \
+           && [[ "$suffix" =~ $ART_SUFFIX_RE ]]; then
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -135,14 +254,15 @@ extract_ep_token() {
 # ---------- Discover season folders -------------------------
 # A season folder is any directory whose name matches the regex
 # AND whose parent is a show folder (i.e. directly under a show).
-# We use find with -mindepth/-maxdepth to keep this fast.
-
-mapfile -t season_folders < <(
-    find "$ROOT_DIR" -mindepth 2 -maxdepth 2 -type d \
-        | awk -v re="$SEASON_DIR_REGEX" \
-              'BEGIN{IGNORECASE=0} { n=split($0,a,"/"); name=a[n];
-                if (re=="" || name ~ re) print $0 }'
-)
+# We use find with -mindepth/-maxdepth to keep this fast, and
+# NUL-delimited output so odd folder names survive intact.
+season_folders=()
+while IFS= read -r -d '' d; do
+    dname="$(basename "$d")"
+    if [ -z "$SEASON_DIR_REGEX" ] || [[ "$dname" =~ $SEASON_DIR_REGEX ]]; then
+        season_folders+=("$d")
+    fi
+done < <(find "${ROOTS[@]}" -mindepth 2 -maxdepth 2 -type d -print0)
 
 log " Season folders found: ${#season_folders[@]}"
 
@@ -151,9 +271,12 @@ sub_rename=0; sub_skip_noop=0; sub_skip_exists=0; sub_skip_noep=0
 tp_rename=0;  tp_skip_noop=0;  tp_skip_exists=0;  tp_skip_noep=0
 ep_ambig=0;   error_count=0
 orphan_delete=0
-duplicate_delete=0
 outlier_delete=0
+duplicate_delete=0
 nfo_outlier_delete=0
+art_outlier_delete=0
+junk_delete=0
+empty_prune=0
 
 # Helper: delete an orphan subtitle (or dry-run log it).
 delete_orphan_sub() {
@@ -193,11 +316,17 @@ for season in "${season_folders[@]}"; do
     # Map: SxxExx -> path of episode video. Also count duplicates.
     declare -A EP_VIDEO=()
     declare -A EP_DUP=()
+    # Lowercase basenames of every video in this season folder,
+    # used by the .nfo pass and the artwork pass.
+    declare -A vid_bases=()
 
     shopt -s nullglob nocaseglob
     for ext in "${VIDEO_EXTS[@]}"; do
         for v in "$season"/*."$ext"; do
             [ -f "$v" ] || continue
+            vb="$(basename "$v")"
+            vb="${vb%.*}"
+            vid_bases["${vb,,}"]=1
             tok="$(extract_ep_token "$(basename "$v")")"
             [ -z "$tok" ] && continue
             if [ -n "${EP_VIDEO[$tok]:-}" ]; then
@@ -383,7 +512,7 @@ for season in "${season_folders[@]}"; do
         fi
 
         ep_basename="$(basename "$ep_video")"      # episode.mkv
-        ep_name_noext="${ep_basename%.*}"           # episode
+        ep_name_noext="${ep_basename%.*}"          # episode
         expected_tp="${ep_name_noext}.trickplay"
         target_path="$season/$expected_tp"
 
@@ -439,16 +568,11 @@ for season in "${season_folders[@]}"; do
     # "season.nfo" convention. Anything else is a stale leftover.
     if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
         declare -A valid_nfo=( ["season.nfo"]=1 )
-        shopt -s nullglob nocaseglob
-        for ext in "${VIDEO_EXTS[@]}"; do
-            for v in "$season"/*."$ext"; do
-                [ -f "$v" ] || continue
-                vbase="$(basename "$v")"
-                key="${vbase%.*}.nfo"
-                valid_nfo["${key,,}"]=1
-            done
+        for vb in "${!vid_bases[@]}"; do
+            valid_nfo["${vb}.nfo"]=1
         done
 
+        shopt -s nullglob nocaseglob
         for nfo in "$season"/*.nfo; do
             [ -f "$nfo" ] || continue
             nfo_name="$(basename "$nfo")"
@@ -473,8 +597,95 @@ for season in "${season_folders[@]}"; do
         unset valid_nfo
     fi
 
-    unset EP_VIDEO EP_DUP
+    # ------------------ OUTLIER ARTWORK ---------------------
+    if [ "$DELETE_OUTLIER_ART" = "true" ]; then
+        shopt -s nullglob nocaseglob
+        for ext in "${ART_EXTS[@]}"; do
+            for img in "$season"/*."$ext"; do
+                [ -f "$img" ] || continue
+                img_name="$(basename "$img")"
+                img_base="${img_name%.*}"
+                art_is_valid "${img_base,,}" && continue
+
+                if [ "$DRY_RUN" = "true" ]; then
+                    log "[ART OUTLIER DRY-RUN delete] $img"
+                    art_outlier_delete=$((art_outlier_delete + 1))
+                else
+                    if rm -- "$img"; then
+                        log "[ART OUTLIER DELETED] $img"
+                        art_outlier_delete=$((art_outlier_delete + 1))
+                    else
+                        log "[ART OUTLIER ERROR] $img"
+                        error_count=$((error_count + 1))
+                    fi
+                fi
+            done
+        done
+        shopt -u nullglob nocaseglob
+    fi
+
+    unset EP_VIDEO EP_DUP vid_bases
 done
+
+# ---------- Junk files --------------------------------------
+# Runs as its own sweep so it also reaches show roots and any
+# folder that isn't a season folder.
+if [ "$DELETE_JUNK" = "true" ]; then
+    log " ---- Junk file deletion pass ----"
+    junk_find_args=(-type f \()
+    first=1
+    for pat in "${JUNK_GLOBS[@]}"; do
+        if [ $first -eq 1 ]; then
+            junk_find_args+=(-iname "$pat"); first=0
+        else
+            junk_find_args+=(-o -iname "$pat")
+        fi
+    done
+    junk_find_args+=(\) -print0)
+
+    while IFS= read -r -d '' j; do
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[JUNK DRY-RUN delete] $j"
+            junk_delete=$((junk_delete + 1))
+        else
+            if rm -- "$j"; then
+                log "[JUNK DELETED] $j"
+                junk_delete=$((junk_delete + 1))
+            else
+                log "[JUNK ERROR] Failed to delete: $j"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done < <(find "${ROOTS[@]}" "${junk_find_args[@]}")
+fi
+
+# ---------- Prune empty folders -----------------------------
+# Last, so folders emptied by the passes above are caught.
+if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
+    log " ---- Empty folder prune pass ----"
+    if [ "$DRY_RUN" = "true" ]; then
+        while IFS= read -r -d '' d; do
+            log "[EMPTY DRY-RUN rmdir] $d"
+            empty_prune=$((empty_prune + 1))
+        done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+        log " NOTE: dry-run lists only folders that are empty RIGHT NOW."
+        log "       Parents that become empty once their children are"
+        log "       removed are not listed here, but will be removed on"
+        log "       a real run."
+    else
+        while :; do
+            pass_removed=0
+            while IFS= read -r -d '' d; do
+                if rmdir -- "$d" 2>/dev/null; then
+                    log "[EMPTY REMOVED] $d"
+                    empty_prune=$((empty_prune + 1))
+                    pass_removed=$((pass_removed + 1))
+                fi
+            done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+            [ "$pass_removed" -eq 0 ] && break
+        done
+    fi
+fi
 
 log "=========================================================="
 log " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -519,6 +730,27 @@ if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
         log " Outlier .nfo would delete:      $nfo_outlier_delete"
     else
         log " Outlier .nfo deleted:           $nfo_outlier_delete"
+    fi
+fi
+if [ "$DELETE_OUTLIER_ART" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Outlier artwork would delete:   $art_outlier_delete"
+    else
+        log " Outlier artwork deleted:        $art_outlier_delete"
+    fi
+fi
+if [ "$DELETE_JUNK" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Junk files would delete:        $junk_delete"
+    else
+        log " Junk files deleted:             $junk_delete"
+    fi
+fi
+if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Empty folders would remove:     $empty_prune"
+    else
+        log " Empty folders removed:          $empty_prune"
     fi
 fi
 log " Errors:                         $error_count"

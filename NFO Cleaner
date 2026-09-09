@@ -2,9 +2,9 @@
 # ============================================================
 #  NFO Cleaner  (Unraid UserScripts)
 # ============================================================
-#  Recursively deletes every .nfo and .nfo-orig file under
-#  ROOT_DIR. Designed to be fast: uses a single `find ... -delete`
-#  call so there is no per-file shell overhead.
+#  Recursively deletes every .nfo and .nfo-orig file under each
+#  configured root. Designed to be fast: a single `find ...
+#  -delete` call, so there is no per-file shell overhead.
 #
 #  Logging, when enabled, is printed to stdout only and is
 #  captured by the Unraid User Scripts run viewer for that run.
@@ -13,9 +13,13 @@
 
 # --------------------- CONFIGURATION ------------------------
 
-# Top-level directory to scan. The script walks everything
-# beneath this path (e.g. Films/, TV/, etc.).
-ROOT_DIR="/mnt/user/Media-Large"
+# One or more top-level directories to scan. Everything beneath
+# each path is walked (e.g. Films/, TV/, ...). A path that does
+# not exist is reported and skipped. Add as many as you like.
+ROOT_DIRS=(
+    "/mnt/user/Media-Large"
+    #"/mnt/user/Media-Small"
+)
 
 # Leave "true" for the first run. Files are listed but NOT
 # deleted. Flip to "false" to actually delete.
@@ -30,10 +34,22 @@ ENABLE_LOG="true"
 
 # --------------------- END CONFIGURATION --------------------
 
-set -u
+set -uo pipefail
 
-if [ ! -d "$ROOT_DIR" ]; then
-    echo "ERROR: ROOT_DIR does not exist: $ROOT_DIR" >&2
+# ---------- Validate roots ----------------------------------
+ROOTS=()
+if [ "${#ROOT_DIRS[@]}" -gt 0 ]; then
+    for r in "${ROOT_DIRS[@]}"; do
+        if [ -d "$r" ]; then
+            ROOTS+=("$r")
+        else
+            echo "WARNING: root does not exist, skipping: $r" >&2
+        fi
+    done
+fi
+
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+    echo "ERROR: none of the configured ROOT_DIRS exist. Nothing to do." >&2
     exit 1
 fi
 
@@ -43,18 +59,20 @@ match=( \( -iname '*.nfo' -o -iname '*.nfo-orig' \) )
 if [ "$ENABLE_LOG" = "true" ]; then
     echo "=========================================================="
     echo " NFO Cleaner: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo " Root:    $ROOT_DIR"
+    for r in "${ROOTS[@]}"; do
+        echo " Root:    $r"
+    done
     echo " Dry-run: $DRY_RUN"
     echo "=========================================================="
 
     if [ "$DRY_RUN" = "true" ]; then
         # Print only; count via wc -l.
-        count=$(find "$ROOT_DIR" -type f "${match[@]}" -print | tee /dev/stderr | wc -l)
+        count=$(find "${ROOTS[@]}" -type f "${match[@]}" -print | tee /dev/stderr | wc -l)
         echo "----------------------------------------------------------"
         echo " Files that WOULD be deleted: $count"
     else
         # Print each file as it's deleted, then count.
-        count=$(find "$ROOT_DIR" -type f "${match[@]}" -print -delete | tee /dev/stderr | wc -l)
+        count=$(find "${ROOTS[@]}" -type f "${match[@]}" -print -delete | tee /dev/stderr | wc -l)
         echo "----------------------------------------------------------"
         echo " Files deleted: $count"
     fi
@@ -67,9 +85,9 @@ else
     if [ "$DRY_RUN" = "true" ]; then
         # Even in silent dry-run we have to do *something* visible
         # or the run looks like a no-op. Emit one summary line only.
-        count=$(find "$ROOT_DIR" -type f "${match[@]}" | wc -l)
+        count=$(find "${ROOTS[@]}" -type f "${match[@]}" | wc -l)
         echo "Dry-run: $count file(s) would be deleted."
     else
-        find "$ROOT_DIR" -type f "${match[@]}" -delete
+        find "${ROOTS[@]}" -type f "${match[@]}" -delete
     fi
 fi

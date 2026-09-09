@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================
-#  Subtitle + Trickplay Renamer for Radarr Movie Folders
-#  (Unraid UserScripts)
+#  Library Cleaner - Film  (Unraid UserScripts)
 # ============================================================
-#  Walks a film library and, for each movie folder, determines
-#  the "main" video (largest video file in that folder) and:
+#  Walks one or more film libraries. For each movie folder it
+#  determines the "main" video (largest video file in that
+#  folder) and then:
 #
 #    1. Renames sibling subtitles  (srt/sub/ass/ssa/vtt/idx/sup)
 #       to match the video's base name, PRESERVING the subtitle's
@@ -12,8 +12,12 @@
 #       .forced .default .foreign.
 #
 #    2. Renames sibling ".trickplay" folders so they are named
-#       "<video_full_filename>.trickplay" (the Jellyfin/Emby
-#       convention is "movie.mkv.trickplay").
+#       "<video_basename_without_extension>.trickplay".
+#
+#    3. Optionally clears out leftovers: orphaned subtitles,
+#       malformed subtitles, duplicate subtitles, stale .nfo
+#       files, stale artwork, junk files and empty folders.
+#       Every deletion is opt-in and honours DRY_RUN.
 #
 #  Subtitle example:
 #    Video: Film (2020)-Radarr.mkv
@@ -22,13 +26,19 @@
 #
 #  Trickplay example:
 #    Video:     Film (2020)-Radarr.mkv
-#    Trickplay: Film (2020) [old name].mkv.trickplay
-#    -->        Film (2020)-Radarr.mkv.trickplay
+#    Trickplay: Film (2020) [old name].trickplay
+#    -->        Film (2020)-Radarr.trickplay
 # ============================================================
 
 # --------------------- CONFIGURATION ------------------------
 
-ROOT_DIR="/mnt/user/Media-Large/Films"
+# One or more library roots to scan. Each is walked
+# independently; a path that does not exist is reported and
+# skipped. Add as many lines as you like.
+ROOT_DIRS=(
+    "/mnt/user/Media-Large/Films"
+    #"/mnt/user/Media-Small/Films"
+)
 
 # IMPORTANT: Leave DRY_RUN="true" for the first run. Inspect the
 # log, then flip to "false" to perform the actual renames.
@@ -48,6 +58,9 @@ VIDEO_EXTS=(mkv mp4 avi m4v mov mpg mpeg wmv flv webm ts m2ts)
 # File extensions we treat as subtitle files.
 SUB_EXTS=(srt sub ass ssa vtt idx sup)
 
+# File extensions we treat as artwork images.
+ART_EXTS=(jpg jpeg png webp tbn bmp)
+
 # Subtitle "flag" suffixes that come after a language code.
 KNOWN_FLAGS=(hi sdh cc forced default foreign cc1 cc2)
 
@@ -63,6 +76,17 @@ MAX_SUFFIX_PARTS=3
 #   ...ar.hi.srt  -> ...ar.srt     (stripped)
 #   ...hi.srt     -> ...hi.srt     (kept - possibly Hindi)
 STRIP_HI="false"
+
+# SAFETY. When "true", a subtitle whose name (minus its language
+# /flag suffix) matches a DIFFERENT video in the same folder is
+# left alone instead of being renamed onto the main feature.
+# This protects flat-stored extras:
+#   Film (2020)-Radarr.mkv            <- main feature
+#   Film (2020)-behindthescenes.mkv   <- extra
+#   Film (2020)-behindthescenes.en.srt  stays put
+# Set to "false" to restore the old behaviour of pairing every
+# subtitle in the folder with the largest video.
+RESPECT_EXTRA_SUBS="true"
 
 # DESTRUCTIVE. When "true", subtitle files whose containing folder
 # has no video file at all are DELETED. Honors DRY_RUN — nothing is
@@ -96,27 +120,93 @@ DELETE_OUTLIER_NFO="false"
 #   skipped) is deleted as a duplicate.
 DELETE_DUPLICATES="false"
 
+# DESTRUCTIVE. When "true", image files in a movie folder that
+# don't correspond to any video there are DELETED. Honors DRY_RUN.
+# An image is KEPT when it is:
+#   - a generic artwork name       (poster.jpg, fanart2.jpg, ...)
+#   - "<video basename>.<ext>"     (Kodi thumb convention)
+#   - "<video basename>-<arttype>" (Film-Radarr-poster.jpg, ...)
+# Anything else is treated as a leftover from a prior rename.
+DELETE_OUTLIER_ART="false"
+
+# DESTRUCTIVE. When "true", files matching JUNK_GLOBS anywhere
+# under the roots are DELETED. Honors DRY_RUN. This runs as its
+# own sweep, so it also reaches folders that contain no video.
+DELETE_JUNK="false"
+
+# DESTRUCTIVE. When "true", empty folders under the roots are
+# removed after all other passes (so folders emptied by this run
+# are caught too). Nested empties collapse: the pass repeats
+# until nothing more can be removed. The roots themselves are
+# never removed. Honors DRY_RUN.
+PRUNE_EMPTY_DIRS="false"
+
+# Generic artwork basenames, used by DELETE_OUTLIER_ART. A
+# trailing number is allowed automatically (fanart2, backdrop3).
+GENERIC_ART_NAMES=(
+    poster folder cover fanart backdrop background banner thumb
+    landscape logo clearart clearlogo disc discart cdart keyart
+    characterart art extrafanart
+)
+
+# Artwork type suffixes that may follow a video basename, used by
+# DELETE_OUTLIER_ART. A trailing number is allowed automatically.
+ART_SUFFIXES=(
+    poster fanart backdrop banner thumb landscape logo clearart
+    clearlogo disc discart cdart keyart
+)
+
+# Junk filename patterns, used by DELETE_JUNK. Matched
+# case-insensitively against the filename only.
+JUNK_GLOBS=(
+    '.DS_Store' '._*' 'Thumbs.db' 'ehthumbs.db' 'desktop.ini'
+    '*.url' '*.sfv' '*.nzb' '*.torrent' '*.md5' 'RARBG*.txt'
+)
+
 # --------------------- END CONFIGURATION --------------------
 
-set -u
+set -uo pipefail
 
+# ---------- Logging -----------------------------------------
+# One append-mode file descriptor opened once, rather than a
+# `tee` fork per line. Falls back to console-only if the log
+# path can't be written.
 if [ "$ENABLE_LOG" = "true" ]; then
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-    log() {
-        echo "$@" | tee -a "$LOG_FILE"
-    }
+    if : >>"$LOG_FILE" 2>/dev/null; then
+        exec {LOG_FD}>>"$LOG_FILE"
+        log() {
+            printf '%s\n' "$*"
+            printf '%s\n' "$*" >&$LOG_FD
+        }
+    else
+        echo "WARNING: cannot write $LOG_FILE - logging to console only" >&2
+        log() { printf '%s\n' "$*"; }
+    fi
 else
     log() { :; }
 fi
 
 log "=========================================================="
-log " Subtitle + Trickplay Renamer: $(date '+%Y-%m-%d %H:%M:%S')"
-log " Root:    $ROOT_DIR"
+log " Library Cleaner - Film: $(date '+%Y-%m-%d %H:%M:%S')"
 log " Dry-run: $DRY_RUN"
+
+# ---------- Validate roots ----------------------------------
+ROOTS=()
+if [ "${#ROOT_DIRS[@]}" -gt 0 ]; then
+    for r in "${ROOT_DIRS[@]}"; do
+        if [ -d "$r" ]; then
+            ROOTS+=("$r")
+            log " Root:    $r"
+        else
+            log " WARNING: root does not exist, skipping: $r"
+        fi
+    done
+fi
 log "=========================================================="
 
-if [ ! -d "$ROOT_DIR" ]; then
-    log "ERROR: ROOT_DIR does not exist: $ROOT_DIR"
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+    log "ERROR: none of the configured ROOT_DIRS exist. Nothing to do."
     exit 1
 fi
 
@@ -125,6 +215,15 @@ FLAG_RE=""
 for f in "${KNOWN_FLAGS[@]}"; do FLAG_RE+="|$f"; done
 FLAG_RE="${FLAG_RE:1}"
 
+# Build artwork regexes for art_is_valid().
+GENERIC_ART_RE=""
+for n in "${GENERIC_ART_NAMES[@]}"; do GENERIC_ART_RE+="|$n"; done
+GENERIC_ART_RE="^(${GENERIC_ART_RE:1})[0-9]*$"
+
+ART_SUFFIX_RE=""
+for n in "${ART_SUFFIXES[@]}"; do ART_SUFFIX_RE+="|$n"; done
+ART_SUFFIX_RE="^(${ART_SUFFIX_RE:1})[0-9]*$"
+
 # Returns 0 if $1 looks like a language code or known flag.
 # Accepts 2-3 letter codes, optional -xx(xx) locale suffix
 # (e.g. pt-br, zh-cn), and any flag from KNOWN_FLAGS.
@@ -132,6 +231,24 @@ is_suffix_component() {
     local c="${1,,}"
     [[ "$c" =~ ^[a-z]{2,3}(-[a-z0-9]{2,4})?$ ]] && return 0
     [[ "$c" =~ ^($FLAG_RE)$ ]] && return 0
+    return 1
+}
+
+# Returns 0 if the lowercase image basename in $1 belongs to this
+# folder's media. Reads the folder-local `vid_bases` map.
+art_is_valid() {
+    local base="$1" candidate suffix
+    [[ "$base" =~ $GENERIC_ART_RE ]] && return 0
+    [ -n "${vid_bases[$base]:-}" ] && return 0
+    candidate="$base"
+    while [[ "$candidate" == *-* ]]; do
+        suffix="${candidate##*-}"
+        candidate="${candidate%-*}"
+        if [ -n "${vid_bases[$candidate]:-}" ] \
+           && [[ "$suffix" =~ $ART_SUFFIX_RE ]]; then
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -169,13 +286,14 @@ while IFS= read -r -d '' video; do
         MAIN_SIZE["$folder"]="$size"
         MAIN_VIDEO["$folder"]="$video"
     fi
-done < <(find "$ROOT_DIR" "${find_args[@]}")
+done < <(find "${ROOTS[@]}" "${find_args[@]}")
 
 # ---------- PASS 2: process each folder exactly once --------
 folder_count=0
 sub_rename=0
 sub_skip_noop=0
 sub_skip_exists=0
+sub_skip_extra=0
 tp_rename=0
 tp_skip_noop=0
 tp_skip_exists=0
@@ -184,6 +302,9 @@ orphan_delete=0
 outlier_delete=0
 nfo_outlier_delete=0
 duplicate_delete=0
+art_outlier_delete=0
+junk_delete=0
+empty_prune=0
 error_count=0
 
 # Helper: delete a malformed subtitle (or dry-run log it).
@@ -209,6 +330,20 @@ for folder in "${!MAIN_VIDEO[@]}"; do
     main_basename="$(basename "$main_video")"    # e.g. movie.mkv
     main_name="${main_basename%.*}"              # e.g. movie
     vcount="${VIDEO_COUNT[$folder]}"
+
+    # Lowercase basenames of every video in this folder. Used by
+    # the extra-subtitle guard, the .nfo pass and the art pass.
+    declare -A vid_bases=()
+    shopt -s nullglob nocaseglob
+    for ext in "${VIDEO_EXTS[@]}"; do
+        for v in "$folder"/*."$ext"; do
+            [ -f "$v" ] || continue
+            vb="$(basename "$v")"
+            vb="${vb%.*}"
+            vid_bases["${vb,,}"]=1
+        done
+    done
+    shopt -u nullglob nocaseglob
 
     # ------------------ SUBTITLES ---------------------------
     shopt -s nullglob nocaseglob
@@ -239,6 +374,18 @@ for folder in "${!MAIN_VIDEO[@]}"; do
                 break
             fi
         done
+
+        # ---- Extra / featurette guard ----------------------
+        # This subtitle already names a DIFFERENT video in the
+        # same folder, so it belongs to that one - not the main
+        # feature. Renaming it would clobber the feature's subs.
+        if [ "$RESPECT_EXTRA_SUBS" = "true" ] \
+           && [ "${remainder,,}" != "${main_name,,}" ] \
+           && [ -n "${vid_bases[${remainder,,}]:-}" ]; then
+            log "[SUB SKIP belongs to extra] $sub"
+            sub_skip_extra=$((sub_skip_extra + 1))
+            continue
+        fi
 
         # ---- Outlier detection -----------------------------
         # 1. Remainder ends in a digit-only token (e.g. .3.hi.srt
@@ -404,16 +551,11 @@ for folder in "${!MAIN_VIDEO[@]}"; do
     # convention. Anything else is a stale leftover.
     if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
         declare -A valid_nfo=( ["movie.nfo"]=1 )
-        shopt -s nullglob nocaseglob
-        for ext in "${VIDEO_EXTS[@]}"; do
-            for v in "$folder"/*."$ext"; do
-                [ -f "$v" ] || continue
-                vbase="$(basename "$v")"
-                key="${vbase%.*}.nfo"
-                valid_nfo["${key,,}"]=1
-            done
+        for vb in "${!vid_bases[@]}"; do
+            valid_nfo["${vb}.nfo"]=1
         done
 
+        shopt -s nullglob nocaseglob
         for nfo in "$folder"/*.nfo; do
             [ -f "$nfo" ] || continue
             nfo_name="$(basename "$nfo")"
@@ -437,6 +579,35 @@ for folder in "${!MAIN_VIDEO[@]}"; do
         shopt -u nullglob nocaseglob
         unset valid_nfo
     fi
+
+    # ------------------ OUTLIER ARTWORK ---------------------
+    if [ "$DELETE_OUTLIER_ART" = "true" ]; then
+        shopt -s nullglob nocaseglob
+        for ext in "${ART_EXTS[@]}"; do
+            for img in "$folder"/*."$ext"; do
+                [ -f "$img" ] || continue
+                img_name="$(basename "$img")"
+                img_base="${img_name%.*}"
+                art_is_valid "${img_base,,}" && continue
+
+                if [ "$DRY_RUN" = "true" ]; then
+                    log "[ART OUTLIER DRY-RUN delete] $img"
+                    art_outlier_delete=$((art_outlier_delete + 1))
+                else
+                    if rm -- "$img"; then
+                        log "[ART OUTLIER DELETED] $img"
+                        art_outlier_delete=$((art_outlier_delete + 1))
+                    else
+                        log "[ART OUTLIER ERROR] $img"
+                        error_count=$((error_count + 1))
+                    fi
+                fi
+            done
+        done
+        shopt -u nullglob nocaseglob
+    fi
+
+    unset vid_bases
 done
 
 # ---------- PASS 3: delete orphaned subtitles ---------------
@@ -472,7 +643,66 @@ if [ "$DELETE_ORPHANS" = "true" ]; then
                 error_count=$((error_count + 1))
             fi
         fi
-    done < <(find "$ROOT_DIR" "${sub_find_args[@]}")
+    done < <(find "${ROOTS[@]}" "${sub_find_args[@]}")
+fi
+
+# ---------- PASS 4: junk files ------------------------------
+# Runs as its own sweep so it also reaches folders with no video.
+if [ "$DELETE_JUNK" = "true" ]; then
+    log " ---- Junk file deletion pass ----"
+    junk_find_args=(-type f \()
+    first=1
+    for pat in "${JUNK_GLOBS[@]}"; do
+        if [ $first -eq 1 ]; then
+            junk_find_args+=(-iname "$pat"); first=0
+        else
+            junk_find_args+=(-o -iname "$pat")
+        fi
+    done
+    junk_find_args+=(\) -print0)
+
+    while IFS= read -r -d '' j; do
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[JUNK DRY-RUN delete] $j"
+            junk_delete=$((junk_delete + 1))
+        else
+            if rm -- "$j"; then
+                log "[JUNK DELETED] $j"
+                junk_delete=$((junk_delete + 1))
+            else
+                log "[JUNK ERROR] Failed to delete: $j"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done < <(find "${ROOTS[@]}" "${junk_find_args[@]}")
+fi
+
+# ---------- PASS 5: prune empty folders ---------------------
+# Last, so folders emptied by the passes above are caught.
+if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
+    log " ---- Empty folder prune pass ----"
+    if [ "$DRY_RUN" = "true" ]; then
+        while IFS= read -r -d '' d; do
+            log "[EMPTY DRY-RUN rmdir] $d"
+            empty_prune=$((empty_prune + 1))
+        done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+        log " NOTE: dry-run lists only folders that are empty RIGHT NOW."
+        log "       Parents that become empty once their children are"
+        log "       removed are not listed here, but will be removed on"
+        log "       a real run."
+    else
+        while :; do
+            pass_removed=0
+            while IFS= read -r -d '' d; do
+                if rmdir -- "$d" 2>/dev/null; then
+                    log "[EMPTY REMOVED] $d"
+                    empty_prune=$((empty_prune + 1))
+                    pass_removed=$((pass_removed + 1))
+                fi
+            done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+            [ "$pass_removed" -eq 0 ] && break
+        done
+    fi
 fi
 
 log "=========================================================="
@@ -487,6 +717,9 @@ else
 fi
 log " Subtitles already correct:      $sub_skip_noop"
 log " Subtitles skipped (exists):     $sub_skip_exists"
+if [ "$RESPECT_EXTRA_SUBS" = "true" ]; then
+    log " Subtitles skipped (extra):      $sub_skip_extra"
+fi
 log " Trickplay already correct:      $tp_skip_noop"
 log " Trickplay skipped (exists):     $tp_skip_exists"
 log " Trickplay skipped (ambiguous):  $tp_skip_ambig"
@@ -516,6 +749,27 @@ if [ "$DELETE_DUPLICATES" = "true" ]; then
         log " Duplicate subs would delete:    $duplicate_delete"
     else
         log " Duplicate subs deleted:         $duplicate_delete"
+    fi
+fi
+if [ "$DELETE_OUTLIER_ART" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Outlier artwork would delete:   $art_outlier_delete"
+    else
+        log " Outlier artwork deleted:        $art_outlier_delete"
+    fi
+fi
+if [ "$DELETE_JUNK" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Junk files would delete:        $junk_delete"
+    else
+        log " Junk files deleted:             $junk_delete"
+    fi
+fi
+if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+        log " Empty folders would remove:     $empty_prune"
+    else
+        log " Empty folders removed:          $empty_prune"
     fi
 fi
 log " Errors:                         $error_count"
