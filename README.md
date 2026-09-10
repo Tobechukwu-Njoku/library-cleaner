@@ -65,6 +65,8 @@ deleted in a dry run.
 | `DUPLICATE_KEEP` | Which file survives when a rename target already exists and `DELETE_DUPLICATES` is on: `largest` (default) or `existing`. A rename keeps the subtitle's extension, so a collision is always between two files of the same format. |
 | `FOLLOW_SYMLINKS` | Pass `-L` to `find` so symlinked roots and subfolders are walked. Off by default — see below. |
 | `LOCK_FILE` | Non-blocking `flock`, so a scheduled run that overruns its interval can't have a second copy renaming the same folders. Set to `""` to disable. |
+| `SUBS_SUBFOLDERS` | **Film only.** Folder names understood to hold subtitles for the film beside them (`Subs`, `Subtitles`, `Subtitle`). Never treated as orphaned, whatever `DELETE_ORPHANS` says. |
+| `PROMOTE_SUBS_FOLDER` | **Film only, default `"true"`.** Rename subtitles out of a `Subs/` folder onto the film and move them up beside it, mapping written-out names (`2_English.srt`) to language codes. Anything unidentifiable is left in place. |
 
 ### Destructive options (all default `"false"`)
 
@@ -118,8 +120,18 @@ deep; add each category as its own entry in `ROOT_DIRS`.
 
 Episodes are matched on an `SxxExx` token, so **absolute-numbered anime**
 (`Show - 001 - Title.mkv`) and **date-named daily shows** are skipped rather than
-renamed, and logged as `no SxxExx`. Multi-episode files (`S01E01-E02`) key off
-the first token.
+renamed, and logged as `no SxxExx`. Multi-episode files claim every episode they
+span — `S01E01-E02`, `S01E01E02` and `S01E01-03` all expand — so a subtitle for
+the second episode isn't left looking orphaned.
+
+Scene releases that put subtitles in a `Subs/` subfolder are handled by the
+**film** script, which renames them onto the film and moves them up. The TV
+script never descends into one, so subtitles there are left untouched.
+
+`.idx` / `.sub` VobSub pairs are moved, renamed and deleted as a unit, and a
+collision is decided on the size of the pair as a whole. Ranking the index and
+the payload separately picks them from different releases, which produces a
+track that looks valid and renders garbage.
 
 **NFO Cleaner** — layout-agnostic.
 
