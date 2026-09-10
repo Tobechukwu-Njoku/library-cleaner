@@ -184,6 +184,18 @@ EXTRA_LANG_CODES=()
 # between two files of the same format.
 DUPLICATE_KEEP="largest"
 
+# SAFETY NET. When set to a path, every file the destructive
+# passes would remove is MOVED there instead of being deleted, so
+# a bad run is recoverable. The original directory structure is
+# recreated under a timestamped folder, e.g.
+#   <TRASH_DIR>/2026-09-10_02-14-33/mnt/user/Media-Large/Films/...
+# Set to "" to delete outright. Honors DRY_RUN either way.
+#
+# Must NOT sit inside any of ROOT_DIRS: the junk and empty-folder
+# passes would walk back into it and undo the safety net. The
+# script refuses to run if it does.
+TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - Film"

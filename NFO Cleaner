@@ -32,6 +32,13 @@ DRY_RUN="true"
 # and is NOT appended to any long-term log file.
 ENABLE_LOG="true"
 
+# SAFETY NET. When set to a path, matched files are MOVED there
+# instead of being deleted, preserving their original directory
+# structure under a timestamped folder. Set to "" to delete
+# outright, which is faster: it uses a single find -delete with no
+# per-file work. Must not sit inside any of ROOT_DIRS.
+TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
+
 # --------------------- END CONFIGURATION --------------------
 
 set -uo pipefail
@@ -53,8 +60,36 @@ if [ "${#ROOTS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+if [ -n "$TRASH_DIR" ]; then
+    for r in "${ROOTS[@]}"; do
+        case "$TRASH_DIR/" in
+            "$r"/*)
+                echo "ERROR: TRASH_DIR is inside a root: $TRASH_DIR" >&2
+                echo "       It would sweep up its own quarantined files." >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
 # Case-insensitive match on both extensions.
 match=( \( -iname '*.nfo' -o -iname '*.nfo-orig' \) )
+
+# Move every match into TRASH_DIR instead of deleting it. Echoes
+# each path so the caller can count and display them exactly as the
+# delete path does.
+trash_matches() {
+    local run_dir dest f
+    run_dir="$TRASH_DIR/$(date '+%Y-%m-%d_%H-%M-%S')"
+    while IFS= read -r -d '' f; do
+        dest="$run_dir/${f#/}"
+        if mkdir -p -- "$(dirname "$dest")" 2>/dev/null && mv -- "$f" "$dest"; then
+            printf '%s\n' "$f"
+        else
+            printf 'ERROR: could not trash: %s\n' "$f" >&2
+        fi
+    done < <(find "${ROOTS[@]}" -type f "${match[@]}" -print0)
+}
 
 if [ "$ENABLE_LOG" = "true" ]; then
     echo "=========================================================="
@@ -71,10 +106,17 @@ if [ "$ENABLE_LOG" = "true" ]; then
         echo "----------------------------------------------------------"
         echo " Files that WOULD be deleted: $count"
     else
-        # Print each file as it's deleted, then count.
-        count=$(find "${ROOTS[@]}" -type f "${match[@]}" -print -delete | tee /dev/stderr | wc -l)
-        echo "----------------------------------------------------------"
-        echo " Files deleted: $count"
+        if [ -n "$TRASH_DIR" ]; then
+            count=$(trash_matches | tee /dev/stderr | wc -l)
+            echo "----------------------------------------------------------"
+            echo " Files moved to trash: $count"
+            echo " Trash: $TRASH_DIR"
+        else
+            # Print each file as it's deleted, then count.
+            count=$(find "${ROOTS[@]}" -type f "${match[@]}" -print -delete | tee /dev/stderr | wc -l)
+            echo "----------------------------------------------------------"
+            echo " Files deleted: $count"
+        fi
     fi
 
     echo " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -87,6 +129,8 @@ else
         # or the run looks like a no-op. Emit one summary line only.
         count=$(find "${ROOTS[@]}" -type f "${match[@]}" | wc -l)
         echo "Dry-run: $count file(s) would be deleted."
+    elif [ -n "$TRASH_DIR" ]; then
+        trash_matches >/dev/null
     else
         find "${ROOTS[@]}" -type f "${match[@]}" -delete
     fi

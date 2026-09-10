@@ -184,6 +184,18 @@ EXTRA_LANG_CODES=()
 # between two files of the same format.
 DUPLICATE_KEEP="largest"
 
+# SAFETY NET. When set to a path, every file the destructive
+# passes would remove is MOVED there instead of being deleted, so
+# a bad run is recoverable. The original directory structure is
+# recreated under a timestamped folder, e.g.
+#   <TRASH_DIR>/2026-09-10_02-14-33/mnt/user/Media-Large/Films/...
+# Set to "" to delete outright. Honors DRY_RUN either way.
+#
+# Must NOT sit inside any of ROOT_DIRS: the junk and empty-folder
+# passes would walk back into it and undo the safety net. The
+# script refuses to run if it does.
+TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - Film"
@@ -233,6 +245,28 @@ log "=========================================================="
 if [ "${#ROOTS[@]}" -eq 0 ]; then
     log "ERROR: none of the configured ROOT_DIRS exist. Nothing to do."
     exit 1
+fi
+
+# ---------- Quarantine --------------------------------------
+# Resolved lazily on first use so a clean run leaves no folders.
+TRASH_RUN_DIR=""
+
+if [ -n "$TRASH_DIR" ]; then
+    for r in "${ROOTS[@]}"; do
+        case "$TRASH_DIR/" in
+            "$r"/*)
+                log "ERROR: TRASH_DIR is inside a library root:"
+                log "         TRASH_DIR: $TRASH_DIR"
+                log "         root:      $r"
+                log "       The junk and empty-folder passes would walk"
+                log "       back into it. Move it outside your libraries."
+                exit 1
+                ;;
+        esac
+    done
+    log " Trash:   $TRASH_DIR"
+else
+    log " Trash:   (disabled - files are deleted outright)"
 fi
 
 # ---------- Regexes built from configuration ----------------
@@ -396,17 +430,42 @@ build_suffix() {
     for c in "${SUFFIX_COMPONENTS[@]}"; do SUFFIX_STRING+=".$c"; done
 }
 
-# Delete a file, honouring DRY_RUN. $2 is the log tag, $3 an
+# Move $1 into TRASH_DIR, preserving its original path, or delete
+# it outright when no TRASH_DIR is configured. Non-zero on failure.
+dispose_file() {
+    local path="$1" dest
+    if [ -z "$TRASH_DIR" ]; then
+        rm -- "$path"
+        return
+    fi
+    if [ -z "$TRASH_RUN_DIR" ]; then
+        TRASH_RUN_DIR="$TRASH_DIR/$(date '+%Y-%m-%d_%H-%M-%S')"
+    fi
+    dest="$TRASH_RUN_DIR/${path#/}"
+    mkdir -p -- "$(dirname "$dest")" 2>/dev/null || return 1
+    mv -- "$path" "$dest"
+}
+
+# Present and past tense for whichever disposal mode is active.
+if [ -n "$TRASH_DIR" ]; then
+    DISPOSE_VERB="trash"
+    DISPOSE_PAST="TRASHED"
+else
+    DISPOSE_VERB="delete"
+    DISPOSE_PAST="DELETED"
+fi
+
+# Dispose of a file, honouring DRY_RUN. $2 is the log tag, $3 an
 # optional reason appended to it. Bumps the counter named in $4.
 delete_file() {
     local path="$1" tag="$2" reason="$3" counter="$4" suffix=""
     [ -n "$reason" ] && suffix=" - $reason"
     if [ "$DRY_RUN" = "true" ]; then
-        log "[$tag DRY-RUN delete$suffix] $path"
+        log "[$tag DRY-RUN $DISPOSE_VERB$suffix] $path"
         printf -v "$counter" '%d' $(( ${!counter} + 1 ))
     else
-        if rm -- "$path"; then
-            log "[$tag DELETED$suffix] $path"
+        if dispose_file "$path"; then
+            log "[$tag $DISPOSE_PAST$suffix] $path"
             printf -v "$counter" '%d' $(( ${!counter} + 1 ))
         else
             log "[$tag ERROR$suffix] $path"
@@ -455,26 +514,27 @@ finish_subtitle() {
                     log "[SUB DUP DRY-RUN replace ($DUPLICATE_KEEP)] $sub"
                     log "                  replaces:  $new_path"
                     duplicate_delete=$((duplicate_delete + 1))
+                elif dispose_file "$new_path" && mv -n -- "$sub" "$new_path"; then
+                    # The loser goes to the trash first, so nothing is
+                    # overwritten in place. Without a TRASH_DIR this is
+                    # a plain delete-then-rename.
+                    log "[SUB DUP REPLACED ($DUPLICATE_KEEP)] $new_path"
+                    log "                      with:  $sub"
+                    duplicate_delete=$((duplicate_delete + 1))
                 else
-                    if mv -f -- "$sub" "$new_path"; then
-                        log "[SUB DUP REPLACED ($DUPLICATE_KEEP)] $new_path"
-                        log "                      with:  $sub"
-                        duplicate_delete=$((duplicate_delete + 1))
-                    else
-                        log "[SUB DUP ERROR] Failed to replace: $new_path"
-                        error_count=$((error_count + 1))
-                    fi
+                    log "[SUB DUP ERROR] Failed to replace: $new_path"
+                    error_count=$((error_count + 1))
                 fi
             elif [ "$DRY_RUN" = "true" ]; then
                 log "[SUB DUP DRY-RUN delete ($DUPLICATE_KEEP)] $sub"
                 log "                target:  $new_path"
                 duplicate_delete=$((duplicate_delete + 1))
             else
-                if rm -- "$sub"; then
-                    log "[SUB DUP DELETED ($DUPLICATE_KEEP)] $sub"
+                if dispose_file "$sub"; then
+                    log "[SUB DUP $DISPOSE_PAST ($DUPLICATE_KEEP)] $sub"
                     duplicate_delete=$((duplicate_delete + 1))
                 else
-                    log "[SUB DUP ERROR] Failed to delete: $sub"
+                    log "[SUB DUP ERROR] Failed to $DISPOSE_VERB: $sub"
                     error_count=$((error_count + 1))
                 fi
             fi
@@ -761,6 +821,10 @@ print_summary() {
         fi
     fi
     summary_line "Errors:" "$error_count"
+    if [ -n "$TRASH_RUN_DIR" ]; then
+        log " Quarantined files are under:"
+        log "   $TRASH_RUN_DIR"
+    fi
     log "=========================================================="
 }
 

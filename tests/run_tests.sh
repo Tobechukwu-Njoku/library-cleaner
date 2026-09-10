@@ -114,6 +114,7 @@ cat > "$WORK/ov_film" <<OV
 ROOT_DIRS=("$WORK/films" "$WORK/films2" "$WORK/does-not-exist")
 DRY_RUN="true"
 ENABLE_LOG="true"
+TRASH_DIR=""
 LOG_FILE="$WORK/film.log"
 DELETE_ORPHANS="true"
 DELETE_OUTLIERS="true"
@@ -237,6 +238,7 @@ cat > "$WORK/ov_tv" <<OV
 ROOT_DIRS=("$WORK/tv")
 DRY_RUN="true"
 ENABLE_LOG="true"
+TRASH_DIR=""
 LOG_FILE="$WORK/tv.log"
 DELETE_ORPHANS="true"
 DELETE_OUTLIERS="true"
@@ -317,6 +319,7 @@ cat > "$WORK/ov_nfo" <<OV
 ROOT_DIRS=("$WORK/nfo1" "$WORK/nfo2" "$WORK/does-not-exist")
 DRY_RUN="true"
 ENABLE_LOG="true"
+TRASH_DIR=""
 OV
 gen "$REPO/NFO Cleaner" "$WORK/nfo.sh" "$WORK/ov_nfo"
 "$WORK/nfo.sh" > "$WORK/nfo.dry.out" 2>&1
@@ -362,6 +365,7 @@ cat > "$WORK/ov_br" <<OV
 ROOT_DIRS=("$FR" "$FR2")
 DRY_RUN="false"
 ENABLE_LOG="true"
+TRASH_DIR=""
 LOG_FILE="$WORK/br.log"
 DELETE_OUTLIER_ART="true"
 DELETE_JUNK="true"
@@ -394,6 +398,7 @@ cat > "$WORK/ov_brtv" <<OV
 ROOT_DIRS=("$TR")
 DRY_RUN="false"
 ENABLE_LOG="true"
+TRASH_DIR=""
 LOG_FILE="$WORK/brtv.log"
 OV
 gen "$REPO/Library Cleaner TV" "$WORK/brtv.sh" "$WORK/ov_brtv"
@@ -410,6 +415,7 @@ cat > "$WORK/ov_brnfo" <<OV
 ROOT_DIRS=("$WORK/br/Media-Large" "$WORK/br/Media-Huge")
 DRY_RUN="false"
 ENABLE_LOG="true"
+TRASH_DIR=""
 OV
 gen "$REPO/NFO Cleaner" "$WORK/brnfo.sh" "$WORK/ov_brnfo"
 "$WORK/brnfo.sh" > "$WORK/brnfo.out" 2>&1
@@ -441,6 +447,7 @@ cat > "$WORK/ov_lang" <<OV
 ROOT_DIRS=("$WORK/lang")
 DRY_RUN="false"
 ENABLE_LOG="false"
+TRASH_DIR=""
 OV
 gen "$REPO/Library Cleaner Film" "$WORK/lang.sh" "$WORK/ov_lang"
 "$WORK/lang.sh" > "$WORK/lang.out" 2>&1
@@ -479,6 +486,7 @@ cat > "$WORK/ov_dup" <<OV
 ROOT_DIRS=("$WORK/dup")
 DRY_RUN="false"
 ENABLE_LOG="false"
+TRASH_DIR=""
 DELETE_DUPLICATES="true"
 DUPLICATE_KEEP="largest"
 OV
@@ -510,6 +518,7 @@ cat > "$WORK/ov_dup3" <<OV
 ROOT_DIRS=("$WORK/dup")
 DRY_RUN="false"
 ENABLE_LOG="false"
+TRASH_DIR=""
 DELETE_DUPLICATES="false"
 OV
 gen "$REPO/Library Cleaner Film" "$WORK/dup3.sh" "$WORK/ov_dup3"
@@ -517,6 +526,107 @@ gen "$REPO/Library Cleaner Film" "$WORK/dup3.sh" "$WORK/ov_dup3"
 n="$(find "$WORK/dup/Film (2020)" -name '*.srt' | wc -l)"
 [ "$n" -eq 2 ] && ok "DELETE_DUPLICATES=false deletes nothing on collision" \
                 || bad "DELETE_DUPLICATES=false left $n subtitles, expected 2"
+
+
+# =====================================================================
+#  QUARANTINE
+# =====================================================================
+echo
+echo "=== QUARANTINE ====================================================="
+rm -rf "$WORK/q" "$WORK/qtrash"
+qd="$WORK/q/films/Film E (2024)"
+mkdir -p "$qd"
+: > "$qd/Film E (2024).en.srt"          # orphan: no video in the folder
+mkdir -p "$WORK/q/films/Film F (2025)"
+head -c 4096 /dev/zero > "$WORK/q/films/Film F (2025)/Film F (2025)-Radarr.mkv"
+: > "$WORK/q/films/Film F (2025)/.DS_Store"
+
+cat > "$WORK/ov_q" <<OV
+ROOT_DIRS=("$WORK/q/films")
+DRY_RUN="false"
+ENABLE_LOG="true"
+LOG_FILE="$WORK/q.log"
+TRASH_DIR="$WORK/qtrash"
+DELETE_ORPHANS="true"
+DELETE_JUNK="true"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/q.sh" "$WORK/ov_q"
+"$WORK/q.sh" > "$WORK/q.out" 2>&1
+
+[ ! -e "$qd/Film E (2024).en.srt" ] \
+    && ok "quarantined orphan left the library" \
+    || bad "quarantined orphan still in the library"
+found="$(find "$WORK/qtrash" -name 'Film E (2024).en.srt' | head -1)"
+[ -n "$found" ] && ok "orphan recoverable from the trash" \
+                || bad "orphan NOT found under the trash dir"
+case "$found" in
+    */Film\ E\ \(2024\)/Film\ E\ \(2024\).en.srt)
+        ok "trash preserves the original folder structure" ;;
+    *)  bad "trash path lost its structure: $found" ;;
+esac
+[ -n "$(find "$WORK/qtrash" -name '.DS_Store' | head -1)" ] \
+    && ok "quarantined junk recoverable too" \
+    || bad "junk was not quarantined"
+grep -q "TRASHED" "$WORK/q.out" \
+    && ok "log says TRASHED rather than DELETED" \
+    || bad "log did not report quarantining"
+grep -q "Quarantined files are under:" "$WORK/q.out" \
+    && ok "summary points at the trash folder" \
+    || bad "summary omits the trash location"
+
+# A trash dir inside a library root defeats the safety net, because
+# the junk and empty-folder passes would walk straight back into it.
+cat > "$WORK/ov_qbad" <<OV
+ROOT_DIRS=("$WORK/q/films")
+DRY_RUN="true"
+ENABLE_LOG="true"
+LOG_FILE="$WORK/qbad.log"
+TRASH_DIR="$WORK/q/films/.trash"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/qbad.sh" "$WORK/ov_qbad"
+"$WORK/qbad.sh" > "$WORK/qbad.out" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ok "refuses to run with TRASH_DIR inside a root" \
+                || bad "accepted a TRASH_DIR inside a library root"
+grep -q "TRASH_DIR is inside a library root" "$WORK/qbad.out" \
+    && ok "explains why it refused" || bad "refusal message missing"
+
+# Dry run must not move anything.
+rm -rf "$WORK/q2" "$WORK/q2trash"
+mkdir -p "$WORK/q2/films/Film G (2026)"
+: > "$WORK/q2/films/Film G (2026)/Film G (2026).en.srt"
+cat > "$WORK/ov_q2" <<OV
+ROOT_DIRS=("$WORK/q2/films")
+DRY_RUN="true"
+ENABLE_LOG="false"
+TRASH_DIR="$WORK/q2trash"
+DELETE_ORPHANS="true"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/q2.sh" "$WORK/ov_q2"
+"$WORK/q2.sh" > /dev/null 2>&1
+[ -f "$WORK/q2/films/Film G (2026)/Film G (2026).en.srt" ] && [ ! -d "$WORK/q2trash" ] \
+    && ok "dry run quarantines nothing and creates no trash folder" \
+    || bad "dry run touched files or created a trash folder"
+
+
+# NFO Cleaner honours the same safety net.
+rm -rf "$WORK/nfoq" "$WORK/nfoqtrash"
+mkdir -p "$WORK/nfoq/a"
+: > "$WORK/nfoq/a/stale.nfo"
+: > "$WORK/nfoq/a/keep.mkv"
+cat > "$WORK/ov_nfoq" <<OV
+ROOT_DIRS=("$WORK/nfoq")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR="$WORK/nfoqtrash"
+OV
+gen "$REPO/NFO Cleaner" "$WORK/nfoq.sh" "$WORK/ov_nfoq"
+"$WORK/nfoq.sh" > "$WORK/nfoq.out" 2>&1
+[ ! -e "$WORK/nfoq/a/stale.nfo" ] && [ -n "$(find "$WORK/nfoqtrash" -name 'stale.nfo' | head -1)" ] \
+    && ok "nfo cleaner quarantines instead of deleting" \
+    || bad "nfo cleaner did not quarantine"
+[ -f "$WORK/nfoq/a/keep.mkv" ] && ok "nfo cleaner left the video alone" \
+                               || bad "nfo cleaner touched the video"
 
 
 # =====================================================================
