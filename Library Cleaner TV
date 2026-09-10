@@ -41,8 +41,14 @@
 # independently; a path that does not exist is reported and
 # skipped. Add as many lines as you like.
 ROOT_DIRS=(
-    "/mnt/user/Media-Large/TV Shows/[2160p, MN]"
-    #"/mnt/user/Media-Large/TV Shows/[1080p]"
+    "/mnt/user/Media-Large/Shows/[1080p, OF]"
+    "/mnt/user/Media-Large/Shows/[1080p, MN]"
+    "/mnt/user/Media-Large/Shows/[2160p, MN]"
+    "/mnt/user/Media-Large/Shows/[2160p, OF]"
+    "/mnt/user/Media-Huge/Shows/[2160p, RX]"
+    "/mnt/user/Media-Huge/Shows/[2160p, BD]"
+    "/mnt/user/Media-Huge/Shows/[1080p, RX]"
+    "/mnt/user/Media-Huge/Shows/[1080p, BD]"
 )
 
 # Leave DRY_RUN="true" for the first run. Inspect log, then flip.

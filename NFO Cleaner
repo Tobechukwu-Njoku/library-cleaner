@@ -18,7 +18,7 @@
 # not exist is reported and skipped. Add as many as you like.
 ROOT_DIRS=(
     "/mnt/user/Media-Large"
-    #"/mnt/user/Media-Small"
+    "/mnt/user/Media-Huge"
 )
 
 # Leave "true" for the first run. Files are listed but NOT
