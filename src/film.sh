@@ -208,6 +208,21 @@ FOLLOW_SYMLINKS="false"
 # renaming the same folder will fight. Set to "" to disable.
 LOCK_FILE="/var/lock/library-cleaner-film.lock"
 
+# Scene releases often ship subtitles in a subfolder beside the
+# film, e.g. "Film (2020)/Subs/2_English.srt". Folders named here
+# are understood to belong to the film next to them, and are never
+# treated as orphaned no matter what DELETE_ORPHANS is set to.
+SUBS_SUBFOLDERS=(Subs Subtitles Subtitle)
+
+# When "true", subtitles inside one of SUBS_SUBFOLDERS are renamed
+# onto the film and moved up beside it, mapping written-out names
+# to language codes:
+#   Film (2020)/Subs/2_English.srt     -> Film (2020)-Radarr.en.srt
+#   Film (2020)/Subs/3_French SDH.srt  -> Film (2020)-Radarr.fr.sdh.srt
+# A subtitle whose language cannot be identified is left where it
+# is and logged, never deleted.
+PROMOTE_SUBS_FOLDER="true"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - Film"
@@ -218,6 +233,7 @@ UNIT_LABEL="Folders"
 # Film-only counters.
 sub_skip_extra=0
 tp_skip_ambig=0
+subs_folder_skip=0
 
 # ---------- PASS 1: collect main video per folder -----------
 # For each folder that contains any video file, remember the
@@ -278,6 +294,9 @@ for folder in "${!MAIN_VIDEO[@]}"; do
         finish_subtitle "$sub" "$main_name" "$folder"
     done
 
+    # ------------------ Subs/ SUBFOLDER ---------------------
+    [ "$PROMOTE_SUBS_FOLDER" = "true" ] && promote_subs_folder "$folder" "$main_name"
+
     # ------------------ TRICKPLAY FOLDERS -------------------
     shopt -s nullglob
     trickplays=("$folder"/*.trickplay)
@@ -330,6 +349,15 @@ if [ "$DELETE_ORPHANS" = "true" ]; then
     while IFS= read -r -d '' sub; do
         folder="${sub%/*}"
         [ -n "${MAIN_VIDEO[$folder]:-}" ] && continue
+        # A Subs/ folder holds no video of its own, which used to
+        # make everything in it look orphaned. It belongs to the
+        # film one level up.
+        if is_subs_subfolder "$folder" \
+           && [ -n "${MAIN_VIDEO[${folder%/*}]:-}" ]; then
+            log "[ORPHAN SKIP subtitles subfolder] $sub"
+            subs_folder_skip=$((subs_folder_skip + 1))
+            continue
+        fi
         delete_file "$sub" "ORPHAN" "" orphan_delete
     done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" "${FIND_EXPR[@]}" -print0)
 fi
@@ -340,6 +368,9 @@ fi
 UNIT_COUNT="$folder_count"
 if [ "$RESPECT_EXTRA_SUBS" = "true" ]; then
     SUMMARY_EXTRA+=("Subtitles skipped (extra):|$sub_skip_extra")
+fi
+if [ "$subs_folder_skip" -gt 0 ]; then
+    SUMMARY_EXTRA+=("Subs/ left in place:|$subs_folder_skip")
 fi
 SUMMARY_EXTRA+=("Trickplay already correct:|$tp_skip_noop")
 SUMMARY_EXTRA+=("Trickplay skipped (exists):|$tp_skip_exists")

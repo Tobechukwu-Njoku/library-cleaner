@@ -505,19 +505,213 @@ delete_file() {
     fi
 }
 
+# A VobSub subtitle is two files: a small .idx index and a large
+# .sub payload. They must share a base name AND come from the same
+# release - an index from one release with the payload of another
+# is a track that looks valid and renders garbage. Everything below
+# moves, renames and deletes the two together.
+declare -A PAIR_HANDLED=()
+
+pair_companion_ext() {
+    case "${1,,}" in
+        idx) COMPANION_EXT="sub" ;;
+        sub) COMPANION_EXT="idx" ;;
+        *)   COMPANION_EXT="" ;;
+    esac
+}
+
+# Look for $1's companion with extension $2 among the subtitles
+# already collected for this folder. Sets COMPANION.
+find_companion() {
+    local sub="$1" want="$2" base cand cand_ext
+    base="${sub%.*}"
+    COMPANION=""
+    for cand in "${COLLECTED_SUBS[@]}"; do
+        [ "$cand" = "$sub" ] && continue
+        [ "${cand%.*}" = "$base" ] || continue
+        cand_ext="${cand##*.}"
+        if [ "${cand_ext,,}" = "$want" ]; then
+            COMPANION="$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Move a VobSub pair to its targets as one unit. Both files get the
+# suffix worked out from the primary, so they cannot drift apart.
+finish_subtitle_pair() {
+    local a="$1" b="$2" ta="$3" tb="$4" collision=0 cs es
+    PAIR_HANDLED["$a"]=1
+    PAIR_HANDLED["$b"]=1
+
+    if [ "$a" = "$ta" ] && [ "$b" = "$tb" ]; then
+        sub_skip_noop=$((sub_skip_noop + 2))
+        return 0
+    fi
+
+    if [ "$ta" != "$a" ] && [ -e "$ta" ]; then collision=1; fi
+    if [ "$tb" != "$b" ] && [ -e "$tb" ]; then collision=1; fi
+
+    if [ "$collision" -eq 1 ]; then
+        if [ "$DELETE_DUPLICATES" != "true" ]; then
+            log "[SUB PAIR SKIP exists] $a"
+            log "                  +    $b"
+            log "             -->      $ta"
+            sub_skip_exists=$((sub_skip_exists + 2))
+            return 0
+        fi
+        # Compare the pairs as wholes. Sizing the .idx and the .sub
+        # separately is what produced mismatched pairs: the index and
+        # the payload rank in opposite directions.
+        cs=$(( $(file_size "$a") + $(file_size "$b") ))
+        es=$(( $(file_size "$ta") + $(file_size "$tb") ))
+        if [ "$DUPLICATE_KEEP" = "existing" ] || [ "$cs" -le "$es" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+                log "[SUB PAIR DRY-RUN $DISPOSE_VERB] $a"
+                log "                          +    $b"
+            else
+                dispose_file "$a"
+                dispose_file "$b"
+                log "[SUB PAIR $DISPOSE_PAST] $a"
+                log "                    +    $b"
+            fi
+            duplicate_delete=$((duplicate_delete + 2))
+            return 0
+        fi
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[SUB PAIR DRY-RUN replace] $ta"
+            log "                      +    $tb"
+        else
+            if [ "$ta" != "$a" ] && [ -e "$ta" ]; then dispose_file "$ta"; fi
+            if [ "$tb" != "$b" ] && [ -e "$tb" ]; then dispose_file "$tb"; fi
+        fi
+        duplicate_delete=$((duplicate_delete + 2))
+    fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[SUB PAIR DRY-RUN] $a"
+        log "              +    $b"
+        log "         -->       $ta"
+        sub_rename=$((sub_rename + 2))
+        return 0
+    fi
+
+    if mv -n -- "$a" "$ta" && mv -n -- "$b" "$tb"; then
+        log "[SUB PAIR RENAMED] ${a##*/} + ${b##*/}"
+        log "              -->  ${ta##*/} + ${tb##*/}"
+        sub_rename=$((sub_rename + 2))
+    else
+        log "[SUB PAIR ERROR] Failed to rename: $a / $b"
+        error_count=$((error_count + 1))
+    fi
+}
+
+# Written-out language names, for scene subtitles that carry a name
+# rather than a code ("2_English.srt", "3_Brazilian Portuguese.srt").
+declare -A LANG_NAME_TO_CODE=(
+    [english]=en    [french]=fr      [spanish]=es     [german]=de
+    [italian]=it    [portuguese]=pt  [brazilian]=pt-br
+    [dutch]=nl      [danish]=da      [swedish]=sv     [norwegian]=no
+    [finnish]=fi    [icelandic]=is   [polish]=pl      [czech]=cs
+    [slovak]=sk     [slovenian]=sl   [hungarian]=hu   [romanian]=ro
+    [bulgarian]=bg  [croatian]=hr    [serbian]=sr     [bosnian]=bs
+    [greek]=el      [turkish]=tr     [russian]=ru     [ukrainian]=uk
+    [arabic]=ar     [hebrew]=he      [persian]=fa     [farsi]=fa
+    [hindi]=hi      [bengali]=bn     [tamil]=ta       [telugu]=te
+    [urdu]=ur       [chinese]=zh     [mandarin]=zh    [cantonese]=zh
+    [japanese]=ja   [korean]=ko      [thai]=th        [vietnamese]=vi
+    [indonesian]=id [malay]=ms       [filipino]=tl    [tagalog]=tl
+    [estonian]=et   [latvian]=lv     [lithuanian]=lt  [albanian]=sq
+    [macedonian]=mk [catalan]=ca     [basque]=eu      [galician]=gl
+    [welsh]=cy      [irish]=ga       [afrikaans]=af   [swahili]=sw
+)
+
+# Work out a language suffix for a subtitle that may be named in
+# the scene style rather than with a dotted code. Sets
+# SUFFIX_COMPONENTS / SUFFIX_REMAINDER. Non-zero when the language
+# cannot be identified, in which case the caller leaves it alone.
+derive_scene_suffix() {
+    local raw="$1" name tok lang="" flags=()
+    peel_suffix "$raw"
+    [ "${#SUFFIX_COMPONENTS[@]}" -gt 0 ] && return 0
+
+    name="${raw,,}"
+    name="${name//[^a-z]/ }"
+    for tok in $name; do
+        if [ -z "$lang" ] && [ -n "${LANG_NAME_TO_CODE[$tok]:-}" ]; then
+            lang="${LANG_NAME_TO_CODE[$tok]}"
+        elif [[ " ${KNOWN_FLAGS[*]} " == *" $tok "* ]]; then
+            flags+=("$tok")
+        fi
+    done
+    [ -z "$lang" ] && return 1
+
+    SUFFIX_COMPONENTS=("$lang" ${flags+"${flags[@]}"})
+    SUFFIX_REMAINDER="$raw"
+    return 0
+}
+
+# Is $1 a folder named like a subtitles subfolder?
+is_subs_subfolder() {
+    local name="${1##*/}" d
+    for d in "${SUBS_SUBFOLDERS[@]}"; do
+        [ "${name,,}" = "${d,,}" ] && return 0
+    done
+    return 1
+}
+
+# Rename subtitles from a Subs/ subfolder onto the film and move
+# them up beside it.
+promote_subs_folder() {
+    local folder="$1" target_base="$2" child sub base
+    shopt -s nullglob
+    for child in "$folder"/*/; do
+        child="${child%/}"
+        [ -d "$child" ] || continue
+        is_subs_subfolder "$child" || continue
+        collect_subs "$child"
+        for sub in "${COLLECTED_SUBS[@]}"; do
+            base="${sub##*/}"
+            if derive_scene_suffix "${base%.*}"; then
+                finish_subtitle "$sub" "$target_base" "$folder"
+            else
+                log "[SUBS FOLDER SKIP unknown language] $sub"
+                subs_folder_skip=$((subs_folder_skip + 1))
+            fi
+        done
+    done
+    shopt -u nullglob
+}
+
 # Rename a subtitle onto $target_base, handling the no-op and
 # already-exists cases. Expects peel_suffix to have run.
 finish_subtitle() {
     local sub="$1" target_base="$2" folder="$3"
     local sub_basename sub_ext new_name new_path
 
+    [ -n "${PAIR_HANDLED[$sub]:-}" ] && return 0
+
     sub_basename="${sub##*/}"
     sub_ext="${sub_basename##*.}"
+
+    # Is this half of a VobSub pair?
+    COMPANION=""
+    pair_companion_ext "$sub_ext"
+    [ -n "$COMPANION_EXT" ] && find_companion "$sub" "$COMPANION_EXT"
 
     detect_outlier
     if [ -n "$OUTLIER_REASON" ]; then
         if [ "$DELETE_OUTLIERS" = "true" ]; then
             delete_file "$sub" "OUTLIER" "$OUTLIER_REASON" outlier_delete
+            PAIR_HANDLED["$sub"]=1
+            if [ -n "$COMPANION" ]; then
+                # Half a VobSub pair is useless, so the index goes
+                # with the payload.
+                delete_file "$COMPANION" "OUTLIER" \
+                    "$OUTLIER_REASON (VobSub pair)" outlier_delete
+                PAIR_HANDLED["$COMPANION"]=1
+            fi
             return
         else
             log "[SUB OUTLIER ($OUTLIER_REASON)] $sub"
@@ -527,6 +721,12 @@ finish_subtitle() {
     build_suffix
     new_name="${target_base}${SUFFIX_STRING}.${sub_ext,,}"
     new_path="$folder/$new_name"
+
+    if [ -n "$COMPANION" ]; then
+        finish_subtitle_pair "$sub" "$COMPANION" "$new_path" \
+            "$folder/${target_base}${SUFFIX_STRING}.${COMPANION_EXT}"
+        return
+    fi
 
     if [ "$sub_basename" = "$new_name" ]; then
         sub_skip_noop=$((sub_skip_noop + 1))
@@ -597,6 +797,7 @@ finish_subtitle() {
 collect_subs() {
     local folder="$1" ext s
     COLLECTED_SUBS=()
+    PAIR_HANDLED=()
     shopt -s nullglob nocaseglob
     for ext in "${SUB_EXTS[@]}"; do
         for s in "$folder"/*."$ext"; do COLLECTED_SUBS+=("$s"); done

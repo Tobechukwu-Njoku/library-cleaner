@@ -753,6 +753,211 @@ grep -q "SUB SKIP exists" "$WORK/me.out" \
 
 
 # =====================================================================
+#  VOBSUB PAIRS
+#  .idx is a small index, .sub the large payload. They must stay
+#  together and come from the same release.
+# =====================================================================
+echo
+echo "=== VOBSUB PAIRS ==================================================="
+vob_fixture() {
+    rm -rf "$WORK/vob"
+    local d="$WORK/vob/Film (2020)"
+    mkdir -p "$d"
+    head -c 4096 /dev/zero > "$d/Film (2020)-Radarr.mkv"
+    # Release A: small index, large payload  (total 9100)
+    head -c 100  /dev/zero > "$d/ReleaseA.en.idx"
+    head -c 9000 /dev/zero > "$d/ReleaseA.en.sub"
+    # Release B: large index, small payload  (total 1400)
+    head -c 900  /dev/zero > "$d/ReleaseB.en.idx"
+    head -c 500  /dev/zero > "$d/ReleaseB.en.sub"
+}
+
+vob_fixture
+cat > "$WORK/ov_vob" <<OV
+ROOT_DIRS=("$WORK/vob")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR=""
+LOCK_FILE=""
+LOG_FILE="$WORK/vob.log"
+DELETE_DUPLICATES="true"
+DUPLICATE_KEEP="largest"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/vob.sh" "$WORK/ov_vob"
+"$WORK/vob.sh" > "$WORK/vob.out" 2>&1
+vd="$WORK/vob/Film (2020)"
+isz="$(stat -c%s "$vd/Film (2020)-Radarr.en.idx" 2>/dev/null || echo 0)"
+ssz="$(stat -c%s "$vd/Film (2020)-Radarr.en.sub" 2>/dev/null || echo 0)"
+if [ "$isz" -eq 100 ] && [ "$ssz" -eq 9000 ]; then
+    ok "winning pair came from one release (idx $isz + sub $ssz)"
+else
+    bad "pair is mismatched: idx $isz, sub $ssz (A=100/9000, B=900/500)"
+fi
+n="$(find "$vd" \( -name '*.idx' -o -name '*.sub' \) | wc -l)"
+[ "$n" -eq 2 ] && ok "exactly one pair survives" || bad "$n VobSub files left, expected 2"
+
+# Both halves must move even when only one needs renaming.
+vob_fixture
+rm "$WORK/vob/Film (2020)/ReleaseB.en.idx" "$WORK/vob/Film (2020)/ReleaseB.en.sub"
+gen "$REPO/Library Cleaner Film" "$WORK/vob2.sh" "$WORK/ov_vob"
+"$WORK/vob2.sh" > "$WORK/vob2.out" 2>&1
+[ -f "$vd/Film (2020)-Radarr.en.idx" ] && [ -f "$vd/Film (2020)-Radarr.en.sub" ] \
+    && ok "both halves renamed together" \
+    || bad "pair was split by the rename"
+
+# A .sub with no .idx is a standalone text subtitle, not a VobSub.
+rm -rf "$WORK/vob3"; d3="$WORK/vob3/Film (2020)"; mkdir -p "$d3"
+head -c 4096 /dev/zero > "$d3/Film (2020)-Radarr.mkv"
+: > "$d3/Whatever.en.sub"
+cat > "$WORK/ov_vob3" <<OV
+ROOT_DIRS=("$WORK/vob3")
+DRY_RUN="false"
+ENABLE_LOG="false"
+TRASH_DIR=""
+LOCK_FILE=""
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/vob3.sh" "$WORK/ov_vob3"
+"$WORK/vob3.sh" > /dev/null 2>&1
+[ -f "$d3/Film (2020)-Radarr.en.sub" ] \
+    && ok "a lone .sub is still handled as a normal subtitle" \
+    || bad "lone .sub was not renamed"
+
+
+# =====================================================================
+#  Subs/ SUBFOLDER
+# =====================================================================
+echo
+echo "=== SUBS SUBFOLDER ================================================="
+subs_fixture() {
+    rm -rf "$WORK/sf"
+    local d="$WORK/sf/Film (2020)"
+    mkdir -p "$d/Subs"
+    head -c 4096 /dev/zero > "$d/Film (2020)-Radarr.mkv"
+    : > "$d/Subs/2_English.srt"
+    : > "$d/Subs/3_French SDH.srt"
+    : > "$d/Subs/4_Brazilian Portuguese.srt"
+    : > "$d/Subs/Movie.es.srt"          # already carries a code
+    : > "$d/Subs/5_Klingon.srt"         # unknown language
+}
+
+subs_fixture
+sd="$WORK/sf/Film (2020)"
+cat > "$WORK/ov_sf" <<OV
+ROOT_DIRS=("$WORK/sf")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR=""
+LOCK_FILE=""
+LOG_FILE="$WORK/sf.log"
+DELETE_ORPHANS="true"
+PROMOTE_SUBS_FOLDER="true"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/sf.sh" "$WORK/ov_sf"
+"$WORK/sf.sh" > "$WORK/sf.out" 2>&1
+
+for want in "Film (2020)-Radarr.en.srt" \
+            "Film (2020)-Radarr.fr.sdh.srt" \
+            "Film (2020)-Radarr.pt-br.srt" \
+            "Film (2020)-Radarr.es.srt"; do
+    [ -f "$sd/$want" ] && ok "promoted: $want" || bad "missing: $want"
+done
+[ -f "$sd/Subs/5_Klingon.srt" ] \
+    && ok "unidentifiable language left in place, not deleted" \
+    || bad "unidentifiable subtitle was removed"
+
+# The protection must hold even with promotion switched off.
+subs_fixture
+sed 's|^PROMOTE_SUBS_FOLDER=.*|PROMOTE_SUBS_FOLDER="false"|' "$WORK/ov_sf" > "$WORK/ov_sf2"
+gen "$REPO/Library Cleaner Film" "$WORK/sf2.sh" "$WORK/ov_sf2"
+"$WORK/sf2.sh" > "$WORK/sf2.out" 2>&1
+n="$(find "$sd/Subs" -name '*.srt' 2>/dev/null | wc -l)"
+[ "$n" -eq 5 ] \
+    && ok "orphan pass leaves a Subs/ folder alone when not promoting" \
+    || bad "orphan pass removed $((5-n)) of 5 subtitles from Subs/"
+grep -q "ORPHAN SKIP subtitles subfolder" "$WORK/sf2.out" \
+    && ok "logs why the Subs/ folder was skipped" \
+    || bad "no log line explaining the Subs/ skip"
+
+# A genuinely orphaned folder is still cleaned up.
+rm -rf "$WORK/sf3"; mkdir -p "$WORK/sf3/Loose"
+: > "$WORK/sf3/Loose/whatever.en.srt"
+cat > "$WORK/ov_sf3" <<OV
+ROOT_DIRS=("$WORK/sf3")
+DRY_RUN="false"
+ENABLE_LOG="false"
+TRASH_DIR=""
+LOCK_FILE=""
+DELETE_ORPHANS="true"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/sf3.sh" "$WORK/ov_sf3"
+"$WORK/sf3.sh" > /dev/null 2>&1
+[ ! -e "$WORK/sf3/Loose/whatever.en.srt" ] \
+    && ok "a real orphan is still deleted" || bad "orphan pass stopped working"
+
+
+# =====================================================================
+#  IDEMPOTENCY
+#  Running twice must be indistinguishable from running once. This
+#  is the invariant that makes the scripts safe to schedule.
+# =====================================================================
+echo
+echo "=== IDEMPOTENCY ===================================================="
+build_film
+cat > "$WORK/ov_idem" <<OV
+ROOT_DIRS=("$WORK/films" "$WORK/films2")
+DRY_RUN="false"
+ENABLE_LOG="false"
+TRASH_DIR=""
+LOCK_FILE=""
+DELETE_ORPHANS="true"
+DELETE_OUTLIERS="true"
+DELETE_OUTLIER_NFO="true"
+DELETE_DUPLICATES="true"
+DELETE_OUTLIER_ART="true"
+DELETE_JUNK="true"
+PRUNE_EMPTY_DIRS="true"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/idem.sh" "$WORK/ov_idem"
+"$WORK/idem.sh" > /dev/null 2>&1
+first="$(snapshot "$WORK/films")"
+"$WORK/idem.sh" > /dev/null 2>&1
+second="$(snapshot "$WORK/films")"
+if [ "$first" = "$second" ]; then
+    ok "film script is idempotent"
+else
+    bad "film script changed the library on a second run"
+    diff <(printf '%s\n' "$first") <(printf '%s\n' "$second") | sed 's/^/       /'
+fi
+
+build_tv
+cat > "$WORK/ov_idemtv" <<OV
+ROOT_DIRS=("$WORK/tv")
+DRY_RUN="false"
+ENABLE_LOG="false"
+TRASH_DIR=""
+LOCK_FILE=""
+DELETE_ORPHANS="true"
+DELETE_OUTLIERS="true"
+DELETE_OUTLIER_NFO="true"
+DELETE_DUPLICATES="true"
+DELETE_OUTLIER_ART="true"
+DELETE_JUNK="true"
+PRUNE_EMPTY_DIRS="true"
+OV
+gen "$REPO/Library Cleaner TV" "$WORK/idemtv.sh" "$WORK/ov_idemtv"
+"$WORK/idemtv.sh" > /dev/null 2>&1
+first="$(snapshot "$WORK/tv")"
+"$WORK/idemtv.sh" > /dev/null 2>&1
+second="$(snapshot "$WORK/tv")"
+if [ "$first" = "$second" ]; then
+    ok "tv script is idempotent"
+else
+    bad "tv script changed the library on a second run"
+    diff <(printf '%s\n' "$first") <(printf '%s\n' "$second") | sed 's/^/       /'
+fi
+
+
+# =====================================================================
 #  BUILD FRESHNESS
 #  The scripts at the repo root are generated from src/ by build.sh.
 #  Catch the case where src/ was edited but build.sh was not re-run.
