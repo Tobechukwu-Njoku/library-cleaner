@@ -161,6 +161,10 @@ JUNK_GLOBS=(
 
 # --------------------- END CONFIGURATION --------------------
 
+SCRIPT_TITLE="Library Cleaner - TV"
+UNIT_LABEL="Season folders"
+
+
 set -uo pipefail
 
 # ---------- Logging -----------------------------------------
@@ -184,7 +188,7 @@ else
 fi
 
 log "=========================================================="
-log " Library Cleaner - TV: $(date '+%Y-%m-%d %H:%M:%S')"
+log " $SCRIPT_TITLE: $(date '+%Y-%m-%d %H:%M:%S')"
 log " Dry-run: $DRY_RUN"
 
 # ---------- Validate roots ----------------------------------
@@ -206,12 +210,11 @@ if [ "${#ROOTS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# Build flag regex for is_suffix_component().
+# ---------- Regexes built from configuration ----------------
 FLAG_RE=""
 for f in "${KNOWN_FLAGS[@]}"; do FLAG_RE+="|$f"; done
 FLAG_RE="${FLAG_RE:1}"
 
-# Build artwork regexes for art_is_valid().
 GENERIC_ART_RE=""
 for n in "${GENERIC_ART_NAMES[@]}"; do GENERIC_ART_RE+="|$n"; done
 GENERIC_ART_RE="^(${GENERIC_ART_RE:1})[0-9]*$"
@@ -220,6 +223,31 @@ ART_SUFFIX_RE=""
 for n in "${ART_SUFFIXES[@]}"; do ART_SUFFIX_RE+="|$n"; done
 ART_SUFFIX_RE="^(${ART_SUFFIX_RE:1})[0-9]*$"
 
+# ---------- Counters ----------------------------------------
+sub_rename=0
+sub_skip_noop=0
+sub_skip_exists=0
+tp_rename=0
+tp_skip_noop=0
+tp_skip_exists=0
+orphan_delete=0
+outlier_delete=0
+nfo_outlier_delete=0
+duplicate_delete=0
+art_outlier_delete=0
+junk_delete=0
+empty_prune=0
+error_count=0
+
+# Extra summary lines contributed by the calling script, each
+# "label|value".
+SUMMARY_EXTRA=()
+
+# ---------- Helpers -----------------------------------------
+
+# Returns 0 if $1 looks like a language code or known flag.
+# Accepts 2-3 letter codes, optional -xx(xx) locale suffix
+# (e.g. pt-br, zh-cn), and any flag from KNOWN_FLAGS.
 is_suffix_component() {
     local c="${1,,}"
     [[ "$c" =~ ^[a-z]{2,3}(-[a-z0-9]{2,4})?$ ]] && return 0
@@ -227,12 +255,228 @@ is_suffix_component() {
     return 1
 }
 
-# Returns 0 if the lowercase image basename in $1 belongs to this
-# season folder's media. Reads the folder-local `vid_bases` map.
+# Peel trailing language / flag components off a subtitle name.
+# Sets SUFFIX_COMPONENTS (in original order) and SUFFIX_REMAINDER.
+peel_suffix() {
+    local remainder="$1" last i
+    SUFFIX_COMPONENTS=()
+    for ((i = 0; i < MAX_SUFFIX_PARTS; i++)); do
+        [[ "$remainder" == *.* ]] || break
+        last="${remainder##*.}"
+        if is_suffix_component "$last"; then
+            SUFFIX_COMPONENTS=("${last,,}" "${SUFFIX_COMPONENTS[@]}")
+            remainder="${remainder%.*}"
+        else
+            break
+        fi
+    done
+    SUFFIX_REMAINDER="$remainder"
+}
+
+# Inspect the peeled result for the malformed patterns we know
+# about. Sets OUTLIER_REASON, empty when the name looks sane.
+#   1. A numeric component just before the lang/flag suffix,
+#      e.g. "...Radarr.3.hi.srt" - junk from audio-track parsing.
+#   2. A duplicated component, e.g. "...hi.hi.srt".
+detect_outlier() {
+    local trailing c
+    OUTLIER_REASON=""
+    if [[ "$SUFFIX_REMAINDER" == *.* ]]; then
+        trailing="${SUFFIX_REMAINDER##*.}"
+        if [[ "$trailing" =~ ^[0-9]+$ ]]; then
+            OUTLIER_REASON="trailing numeric '.$trailing'"
+            return
+        fi
+    fi
+    if [ "${#SUFFIX_COMPONENTS[@]}" -ge 2 ]; then
+        local -A seen=()
+        for c in "${SUFFIX_COMPONENTS[@]}"; do
+            if [ -n "${seen[$c]:-}" ]; then
+                OUTLIER_REASON="duplicate suffix '.$c'"
+                return
+            fi
+            seen["$c"]=1
+        done
+    fi
+}
+
+# Join the peeled components back into a ".xx.yy" suffix,
+# applying STRIP_HI. Result in SUFFIX_STRING.
+build_suffix() {
+    local c
+    if [ "$STRIP_HI" = "true" ] \
+       && [ "${#SUFFIX_COMPONENTS[@]}" -gt 1 ] \
+       && [ "${SUFFIX_COMPONENTS[-1]}" = "hi" ]; then
+        unset 'SUFFIX_COMPONENTS[-1]'
+    fi
+    SUFFIX_STRING=""
+    for c in "${SUFFIX_COMPONENTS[@]}"; do SUFFIX_STRING+=".$c"; done
+}
+
+# Delete a file, honouring DRY_RUN. $2 is the log tag, $3 an
+# optional reason appended to it. Bumps the counter named in $4.
+delete_file() {
+    local path="$1" tag="$2" reason="$3" counter="$4" suffix=""
+    [ -n "$reason" ] && suffix=" - $reason"
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[$tag DRY-RUN delete$suffix] $path"
+        printf -v "$counter" '%d' $(( ${!counter} + 1 ))
+    else
+        if rm -- "$path"; then
+            log "[$tag DELETED$suffix] $path"
+            printf -v "$counter" '%d' $(( ${!counter} + 1 ))
+        else
+            log "[$tag ERROR$suffix] $path"
+            error_count=$((error_count + 1))
+        fi
+    fi
+}
+
+# Rename a subtitle onto $target_base, handling the no-op and
+# already-exists cases. Expects peel_suffix to have run.
+finish_subtitle() {
+    local sub="$1" target_base="$2" folder="$3"
+    local sub_basename sub_ext new_name new_path
+
+    sub_basename="$(basename "$sub")"
+    sub_ext="${sub_basename##*.}"
+
+    detect_outlier
+    if [ -n "$OUTLIER_REASON" ]; then
+        if [ "$DELETE_OUTLIERS" = "true" ]; then
+            delete_file "$sub" "OUTLIER" "$OUTLIER_REASON" outlier_delete
+            return
+        else
+            log "[SUB OUTLIER ($OUTLIER_REASON)] $sub"
+        fi
+    fi
+
+    build_suffix
+    new_name="${target_base}${SUFFIX_STRING}.${sub_ext,,}"
+    new_path="$folder/$new_name"
+
+    if [ "$sub_basename" = "$new_name" ]; then
+        sub_skip_noop=$((sub_skip_noop + 1))
+        return
+    fi
+
+    if [ -e "$new_path" ]; then
+        if [ "$DELETE_DUPLICATES" = "true" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+                log "[SUB DUP DRY-RUN delete] $sub"
+                log "                target:  $new_path"
+                duplicate_delete=$((duplicate_delete + 1))
+            else
+                if rm -- "$sub"; then
+                    log "[SUB DUP DELETED] $sub"
+                    duplicate_delete=$((duplicate_delete + 1))
+                else
+                    log "[SUB DUP ERROR] Failed to delete: $sub"
+                    error_count=$((error_count + 1))
+                fi
+            fi
+        else
+            log "[SUB SKIP exists] $sub"
+            log "             -->  $new_path"
+            sub_skip_exists=$((sub_skip_exists + 1))
+        fi
+        return
+    fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[SUB DRY-RUN] $sub"
+        log "         -->  $new_path"
+        sub_rename=$((sub_rename + 1))
+    else
+        if mv -n -- "$sub" "$new_path"; then
+            log "[SUB RENAMED] $sub_basename"
+            log "         -->  $new_name"
+            sub_rename=$((sub_rename + 1))
+        else
+            log "[SUB ERROR] Failed to rename: $sub"
+            error_count=$((error_count + 1))
+        fi
+    fi
+}
+
+# Collect every subtitle sitting directly in $1.
+collect_subs() {
+    local folder="$1" ext s
+    COLLECTED_SUBS=()
+    shopt -s nullglob nocaseglob
+    for ext in "${SUB_EXTS[@]}"; do
+        for s in "$folder"/*."$ext"; do COLLECTED_SUBS+=("$s"); done
+    done
+    shopt -u nullglob nocaseglob
+}
+
+# Lowercase basenames of every video directly in $1, into the
+# caller's `vid_bases` associative array.
+collect_video_bases() {
+    local folder="$1" ext v vb
+    shopt -s nullglob nocaseglob
+    for ext in "${VIDEO_EXTS[@]}"; do
+        for v in "$folder"/*."$ext"; do
+            [ -f "$v" ] || continue
+            vb="$(basename "$v")"
+            vb="${vb%.*}"
+            vid_bases["${vb,,}"]=1
+        done
+    done
+    shopt -u nullglob nocaseglob
+}
+
+# Returns 0 when the trickplay folder $1 still matches a video
+# that actually exists in $2 (an extra with its own trickplay).
+trickplay_is_paired() {
+    local tp="$1" folder="$2" linked_base vext
+    linked_base="$(basename "$tp")"
+    linked_base="${linked_base%.trickplay}"
+    for vext in "${VIDEO_EXTS[@]}"; do
+        [ -e "$folder/${linked_base}.$vext" ] && return 0
+    done
+    return 1
+}
+
+# Rename trickplay folder $1 to $2, handling the exists case.
+rename_trickplay() {
+    local tp="$1" target_path="$2"
+    local tp_basename expected_tp
+    tp_basename="$(basename "$tp")"
+    expected_tp="$(basename "$target_path")"
+
+    if [ -e "$target_path" ]; then
+        log "[TP SKIP exists] $tp"
+        log "            -->  $target_path"
+        tp_skip_exists=$((tp_skip_exists + 1))
+        return
+    fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+        log "[TP DRY-RUN] $tp"
+        log "        -->  $target_path"
+        tp_rename=$((tp_rename + 1))
+    else
+        if mv -n -- "$tp" "$target_path"; then
+            log "[TP RENAMED] $tp_basename"
+            log "        -->  $expected_tp"
+            tp_rename=$((tp_rename + 1))
+        else
+            log "[TP ERROR] Failed to rename: $tp"
+            error_count=$((error_count + 1))
+        fi
+    fi
+}
+
+# Returns 0 if the lowercase image basename $1 belongs to this
+# folder's media. Reads the caller's `vid_bases` map, and the
+# optional SEASON_ART_RE when the calling script defines one.
 art_is_valid() {
     local base="$1" candidate suffix
     [[ "$base" =~ $GENERIC_ART_RE ]] && return 0
-    [[ "$base" =~ $SEASON_ART_RE ]] && return 0
+    if [ -n "${SEASON_ART_RE:-}" ] && [[ "$base" =~ $SEASON_ART_RE ]]; then
+        return 0
+    fi
     [ -n "${vid_bases[$base]:-}" ] && return 0
     candidate="$base"
     while [[ "$candidate" == *-* ]]; do
@@ -245,6 +489,182 @@ art_is_valid() {
     done
     return 1
 }
+
+# Delete .nfo files in $1 that match no video there. $2 is the
+# alternate convention to keep ("movie.nfo" / "season.nfo").
+nfo_pass() {
+    local folder="$1" alt="$2" nfo nfo_name vb
+    local -A valid_nfo=( ["$alt"]=1 )
+    for vb in "${!vid_bases[@]}"; do
+        valid_nfo["${vb}.nfo"]=1
+    done
+
+    shopt -s nullglob nocaseglob
+    for nfo in "$folder"/*.nfo; do
+        [ -f "$nfo" ] || continue
+        nfo_name="$(basename "$nfo")"
+        [ -n "${valid_nfo[${nfo_name,,}]:-}" ] && continue
+        delete_file "$nfo" "NFO OUTLIER" "" nfo_outlier_delete
+    done
+    shopt -u nullglob nocaseglob
+}
+
+# Delete images in $1 that match no video there.
+art_pass() {
+    local folder="$1" ext img img_name img_base
+    shopt -s nullglob nocaseglob
+    for ext in "${ART_EXTS[@]}"; do
+        for img in "$folder"/*."$ext"; do
+            [ -f "$img" ] || continue
+            img_name="$(basename "$img")"
+            img_base="${img_name%.*}"
+            art_is_valid "${img_base,,}" && continue
+            delete_file "$img" "ART OUTLIER" "" art_outlier_delete
+        done
+    done
+    shopt -u nullglob nocaseglob
+}
+
+# Build a case-insensitive find expression from a list of
+# -iname patterns, into FIND_EXPR.
+build_find_expr() {
+    local first=1 pat
+    FIND_EXPR=(-type f \()
+    for pat in "$@"; do
+        if [ $first -eq 1 ]; then
+            FIND_EXPR+=(-iname "$pat"); first=0
+        else
+            FIND_EXPR+=(-o -iname "$pat")
+        fi
+    done
+    FIND_EXPR+=(\) -print0)
+}
+
+# Sweep junk files across every root. Its own pass, so it also
+# reaches folders that contain no video.
+junk_pass() {
+    local j
+    log " ---- Junk file deletion pass ----"
+    build_find_expr "${JUNK_GLOBS[@]}"
+    while IFS= read -r -d '' j; do
+        delete_file "$j" "JUNK" "" junk_delete
+    done < <(find "${ROOTS[@]}" "${FIND_EXPR[@]}")
+}
+
+# Remove empty folders, repeating until nothing more can go so
+# nested empties collapse. Roots themselves are never removed.
+empty_prune_pass() {
+    local d pass_removed
+    log " ---- Empty folder prune pass ----"
+    if [ "$DRY_RUN" = "true" ]; then
+        while IFS= read -r -d '' d; do
+            log "[EMPTY DRY-RUN rmdir] $d"
+            empty_prune=$((empty_prune + 1))
+        done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+        log " NOTE: dry-run lists only folders that are empty RIGHT NOW."
+        log "       Parents that become empty once their children are"
+        log "       removed are not listed here, but will be removed on"
+        log "       a real run."
+    else
+        while :; do
+            pass_removed=0
+            while IFS= read -r -d '' d; do
+                if rmdir -- "$d" 2>/dev/null; then
+                    log "[EMPTY REMOVED] $d"
+                    empty_prune=$((empty_prune + 1))
+                    pass_removed=$((pass_removed + 1))
+                fi
+            done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+            [ "$pass_removed" -eq 0 ] && break
+        done
+    fi
+}
+
+# Log one "label value" summary line, phrased for dry-run or not.
+summary_line() {
+    local label="$1" value="$2"
+    printf -v label '%-31s' "$label"
+    log " ${label}$value"
+}
+
+print_summary() {
+    local entry label value
+    log "=========================================================="
+    log " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
+    summary_line "$UNIT_LABEL processed:" "$UNIT_COUNT"
+    if [ "$DRY_RUN" = "true" ]; then
+        summary_line "Subtitles would rename:" "$sub_rename"
+        summary_line "Trickplay would rename:" "$tp_rename"
+    else
+        summary_line "Subtitles renamed:" "$sub_rename"
+        summary_line "Trickplay folders renamed:" "$tp_rename"
+    fi
+    summary_line "Subtitles already correct:" "$sub_skip_noop"
+    summary_line "Subtitles skipped (exists):" "$sub_skip_exists"
+
+    for entry in "${SUMMARY_EXTRA[@]}"; do
+        label="${entry%%|*}"
+        value="${entry##*|}"
+        summary_line "$label" "$value"
+    done
+
+    if [ "$DELETE_ORPHANS" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Orphan subs would delete:" "$orphan_delete"
+        else
+            summary_line "Orphan subs deleted:" "$orphan_delete"
+        fi
+    fi
+    if [ "$DELETE_OUTLIERS" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Outlier subs would delete:" "$outlier_delete"
+        else
+            summary_line "Outlier subs deleted:" "$outlier_delete"
+        fi
+    fi
+    if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Outlier .nfo would delete:" "$nfo_outlier_delete"
+        else
+            summary_line "Outlier .nfo deleted:" "$nfo_outlier_delete"
+        fi
+    fi
+    if [ "$DELETE_DUPLICATES" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Duplicate subs would delete:" "$duplicate_delete"
+        else
+            summary_line "Duplicate subs deleted:" "$duplicate_delete"
+        fi
+    fi
+    if [ "$DELETE_OUTLIER_ART" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Outlier artwork would delete:" "$art_outlier_delete"
+        else
+            summary_line "Outlier artwork deleted:" "$art_outlier_delete"
+        fi
+    fi
+    if [ "$DELETE_JUNK" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Junk files would delete:" "$junk_delete"
+        else
+            summary_line "Junk files deleted:" "$junk_delete"
+        fi
+    fi
+    if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Empty folders would remove:" "$empty_prune"
+        else
+            summary_line "Empty folders removed:" "$empty_prune"
+        fi
+    fi
+    summary_line "Errors:" "$error_count"
+    log "=========================================================="
+}
+
+# TV-only counters.
+sub_skip_noep=0
+tp_skip_noep=0
+ep_ambig=0
 
 # Extract the first SxxExx token from a name, uppercased.
 # Returns empty string if no token is found.
@@ -272,67 +692,18 @@ done < <(find "${ROOTS[@]}" -mindepth 2 -maxdepth 2 -type d -print0)
 
 log " Season folders found: ${#season_folders[@]}"
 
-# Counters
-sub_rename=0; sub_skip_noop=0; sub_skip_exists=0; sub_skip_noep=0
-tp_rename=0;  tp_skip_noop=0;  tp_skip_exists=0;  tp_skip_noep=0
-ep_ambig=0;   error_count=0
-orphan_delete=0
-outlier_delete=0
-duplicate_delete=0
-nfo_outlier_delete=0
-art_outlier_delete=0
-junk_delete=0
-empty_prune=0
-
-# Helper: delete an orphan subtitle (or dry-run log it).
-delete_orphan_sub() {
-    local sub="$1" reason="$2"
-    if [ "$DRY_RUN" = "true" ]; then
-        log "[ORPHAN DRY-RUN delete - $reason] $sub"
-        orphan_delete=$((orphan_delete + 1))
-    else
-        if rm -- "$sub"; then
-            log "[ORPHAN DELETED - $reason] $sub"
-            orphan_delete=$((orphan_delete + 1))
-        else
-            log "[ORPHAN ERROR - $reason] $sub"
-            error_count=$((error_count + 1))
-        fi
-    fi
-}
-
-# Helper: delete a malformed subtitle (or dry-run log it).
-delete_outlier_sub() {
-    local sub="$1" reason="$2"
-    if [ "$DRY_RUN" = "true" ]; then
-        log "[OUTLIER DRY-RUN delete - $reason] $sub"
-        outlier_delete=$((outlier_delete + 1))
-    else
-        if rm -- "$sub"; then
-            log "[OUTLIER DELETED - $reason] $sub"
-            outlier_delete=$((outlier_delete + 1))
-        else
-            log "[OUTLIER ERROR - $reason] $sub"
-            error_count=$((error_count + 1))
-        fi
-    fi
-}
-
 for season in "${season_folders[@]}"; do
-    # Map: SxxExx -> path of episode video. Also count duplicates.
+    # Map: SxxExx -> path of episode video. Also flag duplicates.
     declare -A EP_VIDEO=()
     declare -A EP_DUP=()
-    # Lowercase basenames of every video in this season folder,
-    # used by the .nfo pass and the artwork pass.
     declare -A vid_bases=()
+
+    collect_video_bases "$season"
 
     shopt -s nullglob nocaseglob
     for ext in "${VIDEO_EXTS[@]}"; do
         for v in "$season"/*."$ext"; do
             [ -f "$v" ] || continue
-            vb="$(basename "$v")"
-            vb="${vb%.*}"
-            vid_bases["${vb,,}"]=1
             tok="$(extract_ep_token "$(basename "$v")")"
             [ -z "$tok" ] && continue
             if [ -n "${EP_VIDEO[$tok]:-}" ]; then
@@ -346,22 +717,14 @@ for season in "${season_folders[@]}"; do
     shopt -u nullglob nocaseglob
 
     # ---------- SUBTITLES in this season folder -------------
-    shopt -s nullglob nocaseglob
-    subs=()
-    for ext in "${SUB_EXTS[@]}"; do
-        for s in "$season"/*."$ext"; do subs+=("$s"); done
-    done
-    shopt -u nullglob nocaseglob
-
-    for sub in "${subs[@]}"; do
+    collect_subs "$season"
+    for sub in "${COLLECTED_SUBS[@]}"; do
         sub_basename="$(basename "$sub")"
-        sub_ext="${sub_basename##*.}"
-        name_no_ext="${sub_basename%.*}"
 
         tok="$(extract_ep_token "$sub_basename")"
         if [ -z "$tok" ]; then
             if [ "$DELETE_ORPHANS" = "true" ]; then
-                delete_orphan_sub "$sub" "no SxxExx"
+                delete_file "$sub" "ORPHAN" "no SxxExx" orphan_delete
             else
                 log "[SUB SKIP no SxxExx] $sub"
                 sub_skip_noep=$((sub_skip_noep + 1))
@@ -376,7 +739,7 @@ for season in "${season_folders[@]}"; do
         ep_video="${EP_VIDEO[$tok]:-}"
         if [ -z "$ep_video" ]; then
             if [ "$DELETE_ORPHANS" = "true" ]; then
-                delete_orphan_sub "$sub" "no video for $tok"
+                delete_file "$sub" "ORPHAN" "no video for $tok" orphan_delete
             else
                 log "[SUB SKIP no video for $tok] $sub"
                 sub_skip_noep=$((sub_skip_noep + 1))
@@ -385,109 +748,8 @@ for season in "${season_folders[@]}"; do
         fi
 
         ep_basename="$(basename "$ep_video")"
-        ep_name="${ep_basename%.*}"
-
-        # Peel trailing language / flag components.
-        components=()
-        remainder="$name_no_ext"
-        for ((i = 0; i < MAX_SUFFIX_PARTS; i++)); do
-            [[ "$remainder" == *.* ]] || break
-            last="${remainder##*.}"
-            if is_suffix_component "$last"; then
-                components=("${last,,}" "${components[@]}")
-                remainder="${remainder%.*}"
-            else
-                break
-            fi
-        done
-
-        # ---- Outlier detection -----------------------------
-        # 1. Remainder ends in a digit-only token (e.g. .3.hi.srt
-        #    where the .3 is junk from old audio-track parsing).
-        # 2. Peeled components contain a duplicate (e.g. .hi.hi).
-        outlier_reason=""
-        if [[ "$remainder" == *.* ]]; then
-            trailing="${remainder##*.}"
-            if [[ "$trailing" =~ ^[0-9]+$ ]]; then
-                outlier_reason="trailing numeric '.$trailing'"
-            fi
-        fi
-        if [ -z "$outlier_reason" ] && [ ${#components[@]} -ge 2 ]; then
-            declare -A seen_comp=()
-            for c in "${components[@]}"; do
-                if [ -n "${seen_comp[$c]:-}" ]; then
-                    outlier_reason="duplicate suffix '.$c'"
-                    break
-                fi
-                seen_comp["$c"]=1
-            done
-            unset seen_comp
-        fi
-
-        if [ -n "$outlier_reason" ]; then
-            if [ "$DELETE_OUTLIERS" = "true" ]; then
-                delete_outlier_sub "$sub" "$outlier_reason"
-                continue
-            else
-                log "[SUB OUTLIER ($outlier_reason)] $sub"
-            fi
-        fi
-        # ----------------------------------------------------
-
-        # STRIP_HI: drop trailing ".hi" only when not the lone token.
-        if [ "$STRIP_HI" = "true" ] \
-           && [ ${#components[@]} -gt 1 ] \
-           && [ "${components[-1]}" = "hi" ]; then
-            unset 'components[-1]'
-        fi
-
-        suffix=""
-        for c in "${components[@]}"; do suffix+=".$c"; done
-
-        new_name="${ep_name}${suffix}.${sub_ext,,}"
-        new_path="$season/$new_name"
-
-        if [ "$sub_basename" = "$new_name" ]; then
-            sub_skip_noop=$((sub_skip_noop + 1))
-            continue
-        fi
-        if [ -e "$new_path" ]; then
-            if [ "$DELETE_DUPLICATES" = "true" ]; then
-                if [ "$DRY_RUN" = "true" ]; then
-                    log "[SUB DUP DRY-RUN delete] $sub"
-                    log "                target:  $new_path"
-                    duplicate_delete=$((duplicate_delete + 1))
-                else
-                    if rm -- "$sub"; then
-                        log "[SUB DUP DELETED] $sub"
-                        duplicate_delete=$((duplicate_delete + 1))
-                    else
-                        log "[SUB DUP ERROR] Failed to delete: $sub"
-                        error_count=$((error_count + 1))
-                    fi
-                fi
-            else
-                log "[SUB SKIP exists] $sub"
-                log "             -->  $new_path"
-                sub_skip_exists=$((sub_skip_exists + 1))
-            fi
-            continue
-        fi
-
-        if [ "$DRY_RUN" = "true" ]; then
-            log "[SUB DRY-RUN] $sub"
-            log "         -->  $new_path"
-            sub_rename=$((sub_rename + 1))
-        else
-            if mv -n -- "$sub" "$new_path"; then
-                log "[SUB RENAMED] $sub_basename"
-                log "         -->  $new_name"
-                sub_rename=$((sub_rename + 1))
-            else
-                log "[SUB ERROR] Failed to rename: $sub"
-                error_count=$((error_count + 1))
-            fi
-        fi
+        peel_suffix "${sub_basename%.*}"
+        finish_subtitle "$sub" "${ep_basename%.*}" "$season"
     done
 
     # ---------- TRICKPLAY folders in this season folder -----
@@ -517,247 +779,37 @@ for season in "${season_folders[@]}"; do
             continue
         fi
 
-        ep_basename="$(basename "$ep_video")"      # episode.mkv
-        ep_name_noext="${ep_basename%.*}"          # episode
-        expected_tp="${ep_name_noext}.trickplay"
-        target_path="$season/$expected_tp"
+        ep_basename="$(basename "$ep_video")"
+        expected_tp="${ep_basename%.*}.trickplay"
 
         if [ "$tp_basename" = "$expected_tp" ]; then
             tp_skip_noop=$((tp_skip_noop + 1))
             continue
         fi
-
-        # If this trickplay still matches a different existing
-        # video in the same folder (e.g. an extra/featurette video
-        # with its own paired trickplay), leave it alone.
-        linked_base="${tp_basename%.trickplay}"
-        linked_paired=0
-        shopt -s nullglob nocaseglob
-        for vext in "${VIDEO_EXTS[@]}"; do
-            if [ -e "$season/${linked_base}.$vext" ]; then
-                linked_paired=1
-                break
-            fi
-        done
-        shopt -u nullglob nocaseglob
-        if [ $linked_paired -eq 1 ]; then
+        if trickplay_is_paired "$tp" "$season"; then
             tp_skip_noop=$((tp_skip_noop + 1))
             continue
         fi
 
-        if [ -e "$target_path" ]; then
-            log "[TP SKIP exists] $tp"
-            log "            -->  $target_path"
-            tp_skip_exists=$((tp_skip_exists + 1))
-            continue
-        fi
-
-        if [ "$DRY_RUN" = "true" ]; then
-            log "[TP DRY-RUN] $tp"
-            log "        -->  $target_path"
-            tp_rename=$((tp_rename + 1))
-        else
-            if mv -n -- "$tp" "$target_path"; then
-                log "[TP RENAMED] $tp_basename"
-                log "        -->  $expected_tp"
-                tp_rename=$((tp_rename + 1))
-            else
-                log "[TP ERROR] Failed to rename: $tp"
-                error_count=$((error_count + 1))
-            fi
-        fi
+        rename_trickplay "$tp" "$season/$expected_tp"
     done
 
-    # ------------------ OUTLIER .NFO ------------------------
-    # Build the set of valid .nfo names: <episode_video_base>.nfo
-    # for every episode in this season folder, plus the alternate
-    # "season.nfo" convention. Anything else is a stale leftover.
-    if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
-        declare -A valid_nfo=( ["season.nfo"]=1 )
-        for vb in "${!vid_bases[@]}"; do
-            valid_nfo["${vb}.nfo"]=1
-        done
-
-        shopt -s nullglob nocaseglob
-        for nfo in "$season"/*.nfo; do
-            [ -f "$nfo" ] || continue
-            nfo_name="$(basename "$nfo")"
-            if [ -n "${valid_nfo[${nfo_name,,}]:-}" ]; then
-                continue
-            fi
-
-            if [ "$DRY_RUN" = "true" ]; then
-                log "[NFO OUTLIER DRY-RUN delete] $nfo"
-                nfo_outlier_delete=$((nfo_outlier_delete + 1))
-            else
-                if rm -- "$nfo"; then
-                    log "[NFO OUTLIER DELETED] $nfo"
-                    nfo_outlier_delete=$((nfo_outlier_delete + 1))
-                else
-                    log "[NFO OUTLIER ERROR] $nfo"
-                    error_count=$((error_count + 1))
-                fi
-            fi
-        done
-        shopt -u nullglob nocaseglob
-        unset valid_nfo
-    fi
-
-    # ------------------ OUTLIER ARTWORK ---------------------
-    if [ "$DELETE_OUTLIER_ART" = "true" ]; then
-        shopt -s nullglob nocaseglob
-        for ext in "${ART_EXTS[@]}"; do
-            for img in "$season"/*."$ext"; do
-                [ -f "$img" ] || continue
-                img_name="$(basename "$img")"
-                img_base="${img_name%.*}"
-                art_is_valid "${img_base,,}" && continue
-
-                if [ "$DRY_RUN" = "true" ]; then
-                    log "[ART OUTLIER DRY-RUN delete] $img"
-                    art_outlier_delete=$((art_outlier_delete + 1))
-                else
-                    if rm -- "$img"; then
-                        log "[ART OUTLIER DELETED] $img"
-                        art_outlier_delete=$((art_outlier_delete + 1))
-                    else
-                        log "[ART OUTLIER ERROR] $img"
-                        error_count=$((error_count + 1))
-                    fi
-                fi
-            done
-        done
-        shopt -u nullglob nocaseglob
-    fi
+    # ------------------ OUTLIER .NFO / ARTWORK --------------
+    # tvshow.nfo lives in the show root, not a season folder, so
+    # it is never touched by this pass.
+    [ "$DELETE_OUTLIER_NFO" = "true" ] && nfo_pass "$season" "season.nfo"
+    [ "$DELETE_OUTLIER_ART" = "true" ] && art_pass "$season"
 
     unset EP_VIDEO EP_DUP vid_bases
 done
 
-# ---------- Junk files --------------------------------------
-# Runs as its own sweep so it also reaches show roots and any
-# folder that isn't a season folder.
-if [ "$DELETE_JUNK" = "true" ]; then
-    log " ---- Junk file deletion pass ----"
-    junk_find_args=(-type f \()
-    first=1
-    for pat in "${JUNK_GLOBS[@]}"; do
-        if [ $first -eq 1 ]; then
-            junk_find_args+=(-iname "$pat"); first=0
-        else
-            junk_find_args+=(-o -iname "$pat")
-        fi
-    done
-    junk_find_args+=(\) -print0)
+[ "$DELETE_JUNK" = "true" ] && junk_pass
+[ "$PRUNE_EMPTY_DIRS" = "true" ] && empty_prune_pass
 
-    while IFS= read -r -d '' j; do
-        if [ "$DRY_RUN" = "true" ]; then
-            log "[JUNK DRY-RUN delete] $j"
-            junk_delete=$((junk_delete + 1))
-        else
-            if rm -- "$j"; then
-                log "[JUNK DELETED] $j"
-                junk_delete=$((junk_delete + 1))
-            else
-                log "[JUNK ERROR] Failed to delete: $j"
-                error_count=$((error_count + 1))
-            fi
-        fi
-    done < <(find "${ROOTS[@]}" "${junk_find_args[@]}")
-fi
-
-# ---------- Prune empty folders -----------------------------
-# Last, so folders emptied by the passes above are caught.
-if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
-    log " ---- Empty folder prune pass ----"
-    if [ "$DRY_RUN" = "true" ]; then
-        while IFS= read -r -d '' d; do
-            log "[EMPTY DRY-RUN rmdir] $d"
-            empty_prune=$((empty_prune + 1))
-        done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
-        log " NOTE: dry-run lists only folders that are empty RIGHT NOW."
-        log "       Parents that become empty once their children are"
-        log "       removed are not listed here, but will be removed on"
-        log "       a real run."
-    else
-        while :; do
-            pass_removed=0
-            while IFS= read -r -d '' d; do
-                if rmdir -- "$d" 2>/dev/null; then
-                    log "[EMPTY REMOVED] $d"
-                    empty_prune=$((empty_prune + 1))
-                    pass_removed=$((pass_removed + 1))
-                fi
-            done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
-            [ "$pass_removed" -eq 0 ] && break
-        done
-    fi
-fi
-
-log "=========================================================="
-log " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
-log " Season folders processed:       ${#season_folders[@]}"
-if [ "$DRY_RUN" = "true" ]; then
-    log " Subtitles would rename:         $sub_rename"
-    log " Trickplay would rename:         $tp_rename"
-else
-    log " Subtitles renamed:              $sub_rename"
-    log " Trickplay folders renamed:      $tp_rename"
-fi
-log " Subtitles already correct:      $sub_skip_noop"
-log " Subtitles skipped (exists):     $sub_skip_exists"
-log " Subtitles skipped (no episode): $sub_skip_noep"
-log " Trickplay already correct:      $tp_skip_noop"
-log " Trickplay skipped (exists):     $tp_skip_exists"
-log " Trickplay skipped (no episode): $tp_skip_noep"
-log " Skipped (ambiguous duplicate):  $ep_ambig"
-if [ "$DELETE_ORPHANS" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Orphan subs would delete:       $orphan_delete"
-    else
-        log " Orphan subs deleted:            $orphan_delete"
-    fi
-fi
-if [ "$DELETE_DUPLICATES" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Duplicate subs would delete:    $duplicate_delete"
-    else
-        log " Duplicate subs deleted:         $duplicate_delete"
-    fi
-fi
-if [ "$DELETE_OUTLIERS" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Outlier subs would delete:      $outlier_delete"
-    else
-        log " Outlier subs deleted:           $outlier_delete"
-    fi
-fi
-if [ "$DELETE_OUTLIER_NFO" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Outlier .nfo would delete:      $nfo_outlier_delete"
-    else
-        log " Outlier .nfo deleted:           $nfo_outlier_delete"
-    fi
-fi
-if [ "$DELETE_OUTLIER_ART" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Outlier artwork would delete:   $art_outlier_delete"
-    else
-        log " Outlier artwork deleted:        $art_outlier_delete"
-    fi
-fi
-if [ "$DELETE_JUNK" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Junk files would delete:        $junk_delete"
-    else
-        log " Junk files deleted:             $junk_delete"
-    fi
-fi
-if [ "$PRUNE_EMPTY_DIRS" = "true" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-        log " Empty folders would remove:     $empty_prune"
-    else
-        log " Empty folders removed:          $empty_prune"
-    fi
-fi
-log " Errors:                         $error_count"
-log "=========================================================="
+UNIT_COUNT="${#season_folders[@]}"
+SUMMARY_EXTRA+=("Subtitles skipped (no episode):|$sub_skip_noep")
+SUMMARY_EXTRA+=("Trickplay already correct:|$tp_skip_noop")
+SUMMARY_EXTRA+=("Trickplay skipped (exists):|$tp_skip_exists")
+SUMMARY_EXTRA+=("Trickplay skipped (no episode):|$tp_skip_noep")
+SUMMARY_EXTRA+=("Skipped (ambiguous duplicate):|$ep_ambig")
+print_summary

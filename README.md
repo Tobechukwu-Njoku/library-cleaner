@@ -121,6 +121,35 @@ or add `-L` to the `find` calls so links are followed. If you do that, be aware
 that `-L` can revisit the same files through several paths, and that a symlink
 loop will make `find` complain.
 
+## Development
+
+The two renamers share most of their logic, so they are assembled from
+`src/` rather than maintained separately:
+
+```
+src/common.sh   shared logic - logging, subtitle and trickplay handling,
+                the .nfo, artwork, junk and empty-folder passes
+src/film.sh     header, configuration, and the largest-video-per-folder pass
+src/tv.sh       header, configuration, and the SxxExx episode-matching pass
+```
+
+Each `src/*.sh` pulls the shared half in with a `#@include common.sh` line, and
+`./build.sh` inlines it to produce the two self-contained scripts at the repo
+root — so what you paste into Unraid is still a single file with no
+dependencies.
+
+**Edit `src/`, never the generated scripts at the repo root.** Run `./build.sh`
+afterwards and commit both. The test suite fails if a generated script is stale.
+
+Run the tests with:
+
+```bash
+./tests/docker-run.sh
+```
+
+A container is needed because the scripts require bash 4.1+ with GNU findutils
+and coreutils; macOS ships bash 3.2 and BSD tools.
+
 ## Requirements
 
 - Bash 4.1 or newer (associative arrays, `${var,,}`, `exec {fd}>>`).

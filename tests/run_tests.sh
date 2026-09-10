@@ -417,6 +417,35 @@ gen "$REPO/NFO Cleaner" "$WORK/brnfo.sh" "$WORK/ov_brnfo"
     && ok "nfo cleaner reaches into [bracketed] subfolders" \
     || bad "nfo cleaner missed a [bracketed] path"
 
+
+# =====================================================================
+#  BUILD FRESHNESS
+#  The scripts at the repo root are generated from src/ by build.sh.
+#  Catch the case where src/ was edited but build.sh was not re-run.
+# =====================================================================
+echo
+echo "=== BUILD =========================================================="
+check_generated() {
+    local src="$1" out="$2"
+    awk -v dir="$REPO/src" '
+        /^#@include / {
+            f = dir "/" $2
+            while ((getline line < f) > 0) print line
+            close(f)
+            next
+        }
+        { print }
+    ' "$REPO/$src" > "$WORK/generated"
+    if diff -q "$WORK/generated" "$REPO/$out" >/dev/null 2>&1; then
+        ok "$out is up to date with $src"
+    else
+        bad "$out is STALE - run ./build.sh and commit the result"
+        diff "$REPO/$out" "$WORK/generated" | head -20 | sed 's/^/       /'
+    fi
+}
+check_generated "src/film.sh" "Library Cleaner Film"
+check_generated "src/tv.sh"   "Library Cleaner TV"
+
 echo
 echo "===================================================================="
 echo " passed: $PASS   failed: $FAIL"
