@@ -419,6 +419,107 @@ gen "$REPO/NFO Cleaner" "$WORK/brnfo.sh" "$WORK/ov_brnfo"
 
 
 # =====================================================================
+#  LANGUAGE CODES AND DUPLICATE RESOLUTION
+# =====================================================================
+echo
+echo "=== LANGUAGES ======================================================"
+lang_fixture() {
+    rm -rf "$WORK/lang"
+    local d="$WORK/lang/Film (2020)"
+    mkdir -p "$d"
+    head -c 4096 /dev/zero > "$d/Film (2020)-Radarr.mkv"
+    # Release tags that are NOT languages.
+    : > "$d/Film.2020.1080p.WEB.DDP.srt"
+    : > "$d/Film.2020.HDR.ass"
+    # Genuine language codes, which must survive.
+    : > "$d/Film.2020.BluRay.x264-GRP.eng.srt"
+    : > "$d/Film (2020) [x]-Radarr.pt-br.srt"
+    : > "$d/Film (2020) [y]-Radarr.ar.hi.srt"
+}
+lang_fixture
+cat > "$WORK/ov_lang" <<OV
+ROOT_DIRS=("$WORK/lang")
+DRY_RUN="false"
+ENABLE_LOG="false"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/lang.sh" "$WORK/ov_lang"
+"$WORK/lang.sh" > "$WORK/lang.out" 2>&1
+got="$(cd "$WORK/lang/Film (2020)" && ls | LC_ALL=C sort | tr '\n' ' ')"
+
+for fake in web ddp hdr aac; do
+    if printf '%s' "$got" | grep -q "\.$fake\."; then
+        bad "release tag '$fake' was treated as a language"
+    else
+        ok "release tag '$fake' not treated as a language"
+    fi
+done
+[ -f "$WORK/lang/Film (2020)/Film (2020)-Radarr.eng.srt" ] \
+    && ok "ISO 639-2 code 'eng' preserved" || bad "'eng' lost: $got"
+[ -f "$WORK/lang/Film (2020)/Film (2020)-Radarr.pt-br.srt" ] \
+    && ok "regional code 'pt-br' preserved" || bad "'pt-br' lost: $got"
+[ -f "$WORK/lang/Film (2020)/Film (2020)-Radarr.ar.hi.srt" ] \
+    && ok "language+flag 'ar.hi' preserved" || bad "'ar.hi' lost: $got"
+
+echo
+echo "=== DUPLICATE RESOLUTION ==========================================="
+# Two subs that both resolve to the same target. The bigger one is
+# the better subtitle and must be the survivor, whichever order the
+# shell happens to reach them in.
+dup_fixture() {
+    rm -rf "$WORK/dup"
+    local d="$WORK/dup/Film (2020)"
+    mkdir -p "$d"
+    head -c 4096 /dev/zero > "$d/Film (2020)-Radarr.mkv"
+    head -c 100  /dev/zero > "$d/Film.2020.WEB.DDP.srt"     # small
+    head -c 5000 /dev/zero > "$d/Film.2020.HDR.srt"         # large
+}
+
+dup_fixture
+cat > "$WORK/ov_dup" <<OV
+ROOT_DIRS=("$WORK/dup")
+DRY_RUN="false"
+ENABLE_LOG="false"
+DELETE_DUPLICATES="true"
+DUPLICATE_KEEP="largest"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/dup.sh" "$WORK/ov_dup"
+"$WORK/dup.sh" > "$WORK/dup.out" 2>&1
+target="$WORK/dup/Film (2020)/Film (2020)-Radarr.srt"
+if [ -f "$target" ] && [ "$(stat -c%s "$target")" -eq 5000 ]; then
+    ok "DUPLICATE_KEEP=largest kept the bigger subtitle"
+else
+    bad "DUPLICATE_KEEP=largest kept the wrong file (size $(stat -c%s "$target" 2>/dev/null))"
+fi
+n="$(find "$WORK/dup/Film (2020)" -name '*.srt' | wc -l)"
+[ "$n" -eq 1 ] && ok "collision left exactly one subtitle" \
+                || bad "collision left $n subtitles"
+
+dup_fixture
+sed 's|^DUPLICATE_KEEP=.*|DUPLICATE_KEEP="existing"|' "$WORK/ov_dup" > "$WORK/ov_dup2"
+gen "$REPO/Library Cleaner Film" "$WORK/dup2.sh" "$WORK/ov_dup2"
+"$WORK/dup2.sh" > "$WORK/dup2.out" 2>&1
+# "existing" keeps whichever landed first, so only assert that it
+# resolved to a single file rather than which one won.
+n="$(find "$WORK/dup/Film (2020)" -name '*.srt' | wc -l)"
+[ "$n" -eq 1 ] && ok "DUPLICATE_KEEP=existing also resolves to one file" \
+                || bad "DUPLICATE_KEEP=existing left $n subtitles"
+
+# With DELETE_DUPLICATES off, nothing is removed.
+dup_fixture
+cat > "$WORK/ov_dup3" <<OV
+ROOT_DIRS=("$WORK/dup")
+DRY_RUN="false"
+ENABLE_LOG="false"
+DELETE_DUPLICATES="false"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/dup3.sh" "$WORK/ov_dup3"
+"$WORK/dup3.sh" > "$WORK/dup3.out" 2>&1
+n="$(find "$WORK/dup/Film (2020)" -name '*.srt' | wc -l)"
+[ "$n" -eq 2 ] && ok "DELETE_DUPLICATES=false deletes nothing on collision" \
+                || bad "DELETE_DUPLICATES=false left $n subtitles, expected 2"
+
+
+# =====================================================================
 #  BUILD FRESHNESS
 #  The scripts at the repo root are generated from src/ by build.sh.
 #  Catch the case where src/ was edited but build.sh was not re-run.

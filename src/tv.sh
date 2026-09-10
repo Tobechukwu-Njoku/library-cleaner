@@ -159,6 +159,21 @@ JUNK_GLOBS=(
     '*.url' '*.sfv' '*.nzb' '*.torrent' '*.md5' 'RARBG*.txt'
 )
 
+# Extra language codes to recognise, beyond the built-in ISO 639-1
+# and ISO 639-2 sets. Regional forms like "pt-br" and "zh-cn" are
+# already accepted for any known code.
+EXTRA_LANG_CODES=()
+
+# When a subtitle's rename target already exists and
+# DELETE_DUPLICATES is "true", decide which file survives:
+#   "largest"  keep whichever file is bigger  (default)
+#   "existing" keep the file already at the target
+# Without this the winner was whichever file the shell happened to
+# reach first, which has nothing to do with subtitle quality.
+# A rename keeps the subtitle's extension, so a collision is always
+# between two files of the same format.
+DUPLICATE_KEEP="largest"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - TV"

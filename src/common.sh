@@ -79,14 +79,72 @@ SUMMARY_EXTRA=()
 
 # ---------- Helpers -----------------------------------------
 
-# Returns 0 if $1 looks like a language code or known flag.
-# Accepts 2-3 letter codes, optional -xx(xx) locale suffix
-# (e.g. pt-br, zh-cn), and any flag from KNOWN_FLAGS.
+# ISO 639-1 (all two-letter codes) and the common ISO 639-2/B and
+# 639-2/T three-letter codes, plus the special-purpose codes.
+# This is a whitelist on purpose: matching any 2-3 letter token
+# treated release tags as languages, turning
+# "Film.2020.1080p.WEB.DDP.srt" into "Film-Radarr.web.ddp.srt".
+LANG_CODES=(
+    aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br
+    bs ca ce ch co cr cs cu cv cy da de dv dz ee el en eo es et eu
+    fa ff fi fj fo fr fy ga gd gl gn gu gv ha he hi ho hr ht hu hy
+    hz ia id ie ig ii ik io is it iu ja jv ka kg ki kj kk kl km kn
+    ko kr ks ku kv kw ky la lb lg li ln lo lt lu lv mg mh mi mk ml
+    mn mr ms mt my na nb nd ne ng nl nn no nr nv ny oc oj om or os
+    pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn
+    so sq sr ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw
+    ty ug uk ur uz ve vi vo wa wo xh yi yo za zh zu
+    afr alb amh ara arm aze baq bel ben bod bos bul bur cat ces
+    chi cym cze dan deu dut dzo ell eng epo est eus fao fas fij
+    fin fra fre geo ger gla gle glg gre grn guj hat hau heb hin
+    hrv hun hye ice ina ind isl ita jav jpn kal kan kat kaz khm
+    kir kor kur lao lat lav lit ltz mac mal mao mar may mkd mlt
+    mon mri msa mya nld nno nob nor nya ori pan per pol por pus
+    ron rum run rus sin slk slo slv sme smo sna som spa sqi srp
+    swa swe tam tel tgk tha tib tir tuk tur ukr urd uzb vie wel
+    wol xho yid yor zho zul
+    und mul zxx mis
+)
+
+LANG_RE=""
+for lc in "${LANG_CODES[@]}" ${EXTRA_LANG_CODES+"${EXTRA_LANG_CODES[@]}"}; do
+    LANG_RE+="|${lc,,}"
+done
+LANG_RE="${LANG_RE:1}"
+
+# Returns 0 if $1 is a known language code or a known flag.
+# A language may carry a regional suffix (pt-br, zh-cn).
 is_suffix_component() {
     local c="${1,,}"
-    [[ "$c" =~ ^[a-z]{2,3}(-[a-z0-9]{2,4})?$ ]] && return 0
+    [[ "$c" =~ ^($LANG_RE)(-[a-z0-9]{2,4})?$ ]] && return 0
     [[ "$c" =~ ^($FLAG_RE)$ ]] && return 0
     return 1
+}
+
+# Portable "file size in bytes". Unraid is Linux (GNU stat).
+file_size() {
+    stat -c%s -- "$1" 2>/dev/null || stat -f%z -- "$1" 2>/dev/null || echo 0
+}
+
+# Decide which of two colliding subtitles to keep. Echoes
+# "candidate" (the file being renamed) or "existing".
+choose_duplicate() {
+    local candidate="$1" existing="$2"
+    case "$DUPLICATE_KEEP" in
+        existing)
+            printf 'existing'
+            ;;
+        *)
+            local sc se
+            sc="$(file_size "$candidate")"
+            se="$(file_size "$existing")"
+            if [ "$sc" -gt "$se" ]; then
+                printf 'candidate'
+            else
+                printf 'existing'
+            fi
+            ;;
+    esac
 }
 
 # Peel trailing language / flag components off a subtitle name.
@@ -196,13 +254,33 @@ finish_subtitle() {
 
     if [ -e "$new_path" ]; then
         if [ "$DELETE_DUPLICATES" = "true" ]; then
-            if [ "$DRY_RUN" = "true" ]; then
-                log "[SUB DUP DRY-RUN delete] $sub"
+            local winner
+            winner="$(choose_duplicate "$sub" "$new_path")"
+            if [ "$winner" = "candidate" ]; then
+                # The incoming file is the better one. mv -f swaps
+                # it in atomically, so there is no window where
+                # neither file exists.
+                if [ "$DRY_RUN" = "true" ]; then
+                    log "[SUB DUP DRY-RUN replace ($DUPLICATE_KEEP)] $sub"
+                    log "                  replaces:  $new_path"
+                    duplicate_delete=$((duplicate_delete + 1))
+                else
+                    if mv -f -- "$sub" "$new_path"; then
+                        log "[SUB DUP REPLACED ($DUPLICATE_KEEP)] $new_path"
+                        log "                      with:  $sub"
+                        duplicate_delete=$((duplicate_delete + 1))
+                    else
+                        log "[SUB DUP ERROR] Failed to replace: $new_path"
+                        error_count=$((error_count + 1))
+                    fi
+                fi
+            elif [ "$DRY_RUN" = "true" ]; then
+                log "[SUB DUP DRY-RUN delete ($DUPLICATE_KEEP)] $sub"
                 log "                target:  $new_path"
                 duplicate_delete=$((duplicate_delete + 1))
             else
                 if rm -- "$sub"; then
-                    log "[SUB DUP DELETED] $sub"
+                    log "[SUB DUP DELETED ($DUPLICATE_KEEP)] $sub"
                     duplicate_delete=$((duplicate_delete + 1))
                 else
                     log "[SUB DUP ERROR] Failed to delete: $sub"
