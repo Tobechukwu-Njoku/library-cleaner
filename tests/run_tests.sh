@@ -630,6 +630,84 @@ gen "$REPO/NFO Cleaner" "$WORK/nfoq.sh" "$WORK/ov_nfoq"
 
 
 # =====================================================================
+#  SYMLINKED ROOTS AND SINGLE-INSTANCE LOCK
+# =====================================================================
+echo
+echo "=== SYMLINKS AND LOCKING ==========================================="
+sym_fixture() {
+    rm -rf "$WORK/sym"
+    mkdir -p "$WORK/sym/real/Film A (2020)"
+    head -c 4096 /dev/zero > "$WORK/sym/real/Film A (2020)/Film A (2020)-Radarr.mkv"
+    : > "$WORK/sym/real/Film A (2020)/Film A (2020) [x]-Radarr.en.srt"
+    ln -s "$WORK/sym/real" "$WORK/sym/link"
+}
+
+sym_fixture
+cat > "$WORK/ov_sym" <<OV
+ROOT_DIRS=("$WORK/sym/link")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR=""
+LOCK_FILE=""
+LOG_FILE="$WORK/sym.log"
+FOLLOW_SYMLINKS="false"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/sym.sh" "$WORK/ov_sym"
+"$WORK/sym.sh" > "$WORK/sym.out" 2>&1
+grep -q "that root is a symlink" "$WORK/sym.out" \
+    && ok "warns that a symlinked root will yield nothing" \
+    || bad "no warning for a symlinked root"
+[ -f "$WORK/sym/real/Film A (2020)/Film A (2020) [x]-Radarr.en.srt" ] \
+    && ok "symlinked root is indeed skipped when not following" \
+    || bad "symlinked root was processed despite FOLLOW_SYMLINKS=false"
+
+sym_fixture
+sed 's|^FOLLOW_SYMLINKS=.*|FOLLOW_SYMLINKS="true"|' "$WORK/ov_sym" > "$WORK/ov_sym2"
+gen "$REPO/Library Cleaner Film" "$WORK/sym2.sh" "$WORK/ov_sym2"
+"$WORK/sym2.sh" > "$WORK/sym2.out" 2>&1
+[ -f "$WORK/sym/real/Film A (2020)/Film A (2020)-Radarr.en.srt" ] \
+    && ok "FOLLOW_SYMLINKS=true walks a symlinked root" \
+    || bad "FOLLOW_SYMLINKS=true did not walk the symlinked root"
+
+if command -v flock >/dev/null 2>&1; then
+    rm -rf "$WORK/lk"; mkdir -p "$WORK/lk/Film A (2020)"
+    head -c 4096 /dev/zero > "$WORK/lk/Film A (2020)/Film A (2020)-Radarr.mkv"
+    cat > "$WORK/ov_lk" <<OV
+ROOT_DIRS=("$WORK/lk")
+DRY_RUN="true"
+ENABLE_LOG="true"
+TRASH_DIR=""
+LOG_FILE="$WORK/lk.log"
+LOCK_FILE="$WORK/lk.lock"
+OV
+    gen "$REPO/Library Cleaner Film" "$WORK/lk.sh" "$WORK/ov_lk"
+
+    "$WORK/lk.sh" > "$WORK/lk.out" 2>&1
+    [ $? -eq 0 ] && ok "runs normally when the lock is free" \
+                 || bad "failed to run with a free lock"
+
+    # Hold the lock, then confirm a second run refuses to start.
+    exec 200>"$WORK/lk.lock"
+    flock -n 200
+    "$WORK/lk.sh" > "$WORK/lk2.out" 2>&1
+    rc=$?
+    exec 200>&-
+    [ "$rc" -ne 0 ] && ok "refuses to start while another run holds the lock" \
+                    || bad "second run started despite the lock"
+    grep -q "another run is already in progress" "$WORK/lk2.out" \
+        && ok "explains that a run is already in progress" \
+        || bad "lock refusal message missing"
+
+    # And the lock is released afterwards.
+    "$WORK/lk.sh" > "$WORK/lk3.out" 2>&1
+    [ $? -eq 0 ] && ok "lock is released when the run finishes" \
+                 || bad "lock was not released"
+else
+    ok "flock unavailable in this image - lock tests skipped"
+fi
+
+
+# =====================================================================
 #  BUILD FRESHNESS
 #  The scripts at the repo root are generated from src/ by build.sh.
 #  Catch the case where src/ was edited but build.sh was not re-run.

@@ -196,6 +196,18 @@ DUPLICATE_KEEP="largest"
 # script refuses to run if it does.
 TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
 
+# When "true", find follows symbolic links, so a symlinked root
+# or subfolder is walked instead of silently yielding nothing.
+# Off by default: following links can reach the same file by
+# several paths, and a symlink loop makes find error out. A root
+# that is a symlink is reported when this is "false".
+FOLLOW_SYMLINKS="false"
+
+# Guards against two copies running at once, which matters if you
+# schedule this and a run overruns its interval - two passes
+# renaming the same folder will fight. Set to "" to disable.
+LOCK_FILE="/var/lock/library-cleaner-film.lock"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - Film"
@@ -219,16 +231,19 @@ video_globs=()
 for ext in "${VIDEO_EXTS[@]}"; do video_globs+=("*.$ext"); done
 build_find_expr "${video_globs[@]}"
 
-while IFS= read -r -d '' video; do
-    folder="$(dirname "$video")"
+# -printf hands back the size with the path, so this walk costs no
+# forks at all. It used to run stat and dirname once per video,
+# which across a library this size is tens of thousands of each.
+# The path is read last, so a tab in a filename is still safe.
+while IFS=$'\t' read -r -d '' size video; do
+    folder="${video%/*}"
     VIDEO_COUNT["$folder"]=$(( ${VIDEO_COUNT["$folder"]:-0} + 1 ))
-    size="$(file_size "$video")"
     current="${MAIN_SIZE[$folder]:-0}"
     if [ "$size" -gt "$current" ]; then
         MAIN_SIZE["$folder"]="$size"
         MAIN_VIDEO["$folder"]="$video"
     fi
-done < <(find "${ROOTS[@]}" "${FIND_EXPR[@]}")
+done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" "${FIND_EXPR[@]}" -printf '%s\t%p\0')
 
 # ---------- PASS 2: process each folder exactly once --------
 folder_count=0
@@ -236,7 +251,7 @@ folder_count=0
 for folder in "${!MAIN_VIDEO[@]}"; do
     folder_count=$((folder_count + 1))
     main_video="${MAIN_VIDEO[$folder]}"
-    main_basename="$(basename "$main_video")"    # e.g. movie.mkv
+    main_basename="${main_video##*/}"            # e.g. movie.mkv
     main_name="${main_basename%.*}"              # e.g. movie
     vcount="${VIDEO_COUNT[$folder]}"
 
@@ -246,7 +261,7 @@ for folder in "${!MAIN_VIDEO[@]}"; do
     # ------------------ SUBTITLES ---------------------------
     collect_subs "$folder"
     for sub in "${COLLECTED_SUBS[@]}"; do
-        sub_basename="$(basename "$sub")"
+        sub_basename="${sub##*/}"
         peel_suffix "${sub_basename%.*}"
 
         # Extra / featurette guard. This subtitle already names a
@@ -270,7 +285,7 @@ for folder in "${!MAIN_VIDEO[@]}"; do
 
     for tp in "${trickplays[@]}"; do
         [ -d "$tp" ] || continue
-        tp_basename="$(basename "$tp")"
+        tp_basename="${tp##*/}"
         expected_tp="${main_name}.trickplay"
 
         if [ "$tp_basename" = "$expected_tp" ]; then
@@ -313,10 +328,10 @@ if [ "$DELETE_ORPHANS" = "true" ]; then
     build_find_expr "${sub_globs[@]}"
 
     while IFS= read -r -d '' sub; do
-        folder="$(dirname "$sub")"
+        folder="${sub%/*}"
         [ -n "${MAIN_VIDEO[$folder]:-}" ] && continue
         delete_file "$sub" "ORPHAN" "" orphan_delete
-    done < <(find "${ROOTS[@]}" "${FIND_EXPR[@]}")
+    done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" "${FIND_EXPR[@]}" -print0)
 fi
 
 [ "$DELETE_JUNK" = "true" ] && junk_pass

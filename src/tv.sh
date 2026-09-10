@@ -186,6 +186,18 @@ DUPLICATE_KEEP="largest"
 # script refuses to run if it does.
 TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
 
+# When "true", find follows symbolic links, so a symlinked root
+# or subfolder is walked instead of silently yielding nothing.
+# Off by default: following links can reach the same file by
+# several paths, and a symlink loop makes find error out. A root
+# that is a symlink is reported when this is "false".
+FOLLOW_SYMLINKS="false"
+
+# Guards against two copies running at once, which matters if you
+# schedule this and a run overruns its interval - two passes
+# renaming the same folder will fight. Set to "" to disable.
+LOCK_FILE="/var/lock/library-cleaner-tv.lock"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - TV"
@@ -216,11 +228,11 @@ extract_ep_token() {
 # NUL-delimited output so odd folder names survive intact.
 season_folders=()
 while IFS= read -r -d '' d; do
-    dname="$(basename "$d")"
+    dname="${d##*/}"
     if [ -z "$SEASON_DIR_REGEX" ] || [[ "$dname" =~ $SEASON_DIR_REGEX ]]; then
         season_folders+=("$d")
     fi
-done < <(find "${ROOTS[@]}" -mindepth 2 -maxdepth 2 -type d -print0)
+done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" -mindepth 2 -maxdepth 2 -type d -print0)
 
 log " Season folders found: ${#season_folders[@]}"
 
@@ -236,7 +248,7 @@ for season in "${season_folders[@]}"; do
     for ext in "${VIDEO_EXTS[@]}"; do
         for v in "$season"/*."$ext"; do
             [ -f "$v" ] || continue
-            tok="$(extract_ep_token "$(basename "$v")")"
+            tok="$(extract_ep_token "${v##*/}")"
             [ -z "$tok" ] && continue
             if [ -n "${EP_VIDEO[$tok]:-}" ]; then
                 EP_DUP["$tok"]=1
@@ -251,7 +263,7 @@ for season in "${season_folders[@]}"; do
     # ---------- SUBTITLES in this season folder -------------
     collect_subs "$season"
     for sub in "${COLLECTED_SUBS[@]}"; do
-        sub_basename="$(basename "$sub")"
+        sub_basename="${sub##*/}"
 
         tok="$(extract_ep_token "$sub_basename")"
         if [ -z "$tok" ]; then
@@ -279,7 +291,7 @@ for season in "${season_folders[@]}"; do
             continue
         fi
 
-        ep_basename="$(basename "$ep_video")"
+        ep_basename="${ep_video##*/}"
         peel_suffix "${sub_basename%.*}"
         finish_subtitle "$sub" "${ep_basename%.*}" "$season"
     done
@@ -291,7 +303,7 @@ for season in "${season_folders[@]}"; do
 
     for tp in "${trickplays[@]}"; do
         [ -d "$tp" ] || continue
-        tp_basename="$(basename "$tp")"
+        tp_basename="${tp##*/}"
 
         tok="$(extract_ep_token "$tp_basename")"
         if [ -z "$tok" ]; then
@@ -311,7 +323,7 @@ for season in "${season_folders[@]}"; do
             continue
         fi
 
-        ep_basename="$(basename "$ep_video")"
+        ep_basename="${ep_video##*/}"
         expected_tp="${ep_basename%.*}.trickplay"
 
         if [ "$tp_basename" = "$expected_tp" ]; then

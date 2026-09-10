@@ -25,13 +25,42 @@ log "=========================================================="
 log " $SCRIPT_TITLE: $(date '+%Y-%m-%d %H:%M:%S')"
 log " Dry-run: $DRY_RUN"
 
+# ---------- Single instance ---------------------------------
+if [ -n "${LOCK_FILE:-}" ]; then
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+        if exec {LOCK_FD}>"$LOCK_FILE" 2>/dev/null; then
+            if ! flock -n "$LOCK_FD"; then
+                log "ERROR: another run is already in progress."
+                log "       Lock held on: $LOCK_FILE"
+                exit 1
+            fi
+        else
+            log " WARNING: cannot open $LOCK_FILE - running unlocked"
+        fi
+    else
+        log " WARNING: flock not available - running unlocked"
+    fi
+fi
+
 # ---------- Validate roots ----------------------------------
+# find only follows symlinks when given -L, so without it a
+# symlinked root passes the -d test and then yields nothing.
+FIND_OPTS=()
+[ "${FOLLOW_SYMLINKS:-false}" = "true" ] && FIND_OPTS=(-L)
+
 ROOTS=()
 if [ "${#ROOT_DIRS[@]}" -gt 0 ]; then
     for r in "${ROOT_DIRS[@]}"; do
         if [ -d "$r" ]; then
             ROOTS+=("$r")
             log " Root:    $r"
+            if [ -L "$r" ] && [ "${FOLLOW_SYMLINKS:-false}" != "true" ]; then
+                log " WARNING: that root is a symlink and FOLLOW_SYMLINKS"
+                log "          is \"false\", so it will yield nothing."
+                log "          Set FOLLOW_SYMLINKS=\"true\" or point"
+                log "          ROOT_DIRS at the real path."
+            fi
         else
             log " WARNING: root does not exist, skipping: $r"
         fi
@@ -277,7 +306,7 @@ finish_subtitle() {
     local sub="$1" target_base="$2" folder="$3"
     local sub_basename sub_ext new_name new_path
 
-    sub_basename="$(basename "$sub")"
+    sub_basename="${sub##*/}"
     sub_ext="${sub_basename##*.}"
 
     detect_outlier
@@ -378,7 +407,7 @@ collect_video_bases() {
     for ext in "${VIDEO_EXTS[@]}"; do
         for v in "$folder"/*."$ext"; do
             [ -f "$v" ] || continue
-            vb="$(basename "$v")"
+            vb="${v##*/}"
             vb="${vb%.*}"
             vid_bases["${vb,,}"]=1
         done
@@ -390,7 +419,7 @@ collect_video_bases() {
 # that actually exists in $2 (an extra with its own trickplay).
 trickplay_is_paired() {
     local tp="$1" folder="$2" linked_base vext
-    linked_base="$(basename "$tp")"
+    linked_base="${tp##*/}"
     linked_base="${linked_base%.trickplay}"
     for vext in "${VIDEO_EXTS[@]}"; do
         [ -e "$folder/${linked_base}.$vext" ] && return 0
@@ -402,8 +431,8 @@ trickplay_is_paired() {
 rename_trickplay() {
     local tp="$1" target_path="$2"
     local tp_basename expected_tp
-    tp_basename="$(basename "$tp")"
-    expected_tp="$(basename "$target_path")"
+    tp_basename="${tp##*/}"
+    expected_tp="${target_path##*/}"
 
     if [ -e "$target_path" ]; then
         log "[TP SKIP exists] $tp"
@@ -462,7 +491,7 @@ nfo_pass() {
     shopt -s nullglob nocaseglob
     for nfo in "$folder"/*.nfo; do
         [ -f "$nfo" ] || continue
-        nfo_name="$(basename "$nfo")"
+        nfo_name="${nfo##*/}"
         [ -n "${valid_nfo[${nfo_name,,}]:-}" ] && continue
         delete_file "$nfo" "NFO OUTLIER" "" nfo_outlier_delete
     done
@@ -476,7 +505,7 @@ art_pass() {
     for ext in "${ART_EXTS[@]}"; do
         for img in "$folder"/*."$ext"; do
             [ -f "$img" ] || continue
-            img_name="$(basename "$img")"
+            img_name="${img##*/}"
             img_base="${img_name%.*}"
             art_is_valid "${img_base,,}" && continue
             delete_file "$img" "ART OUTLIER" "" art_outlier_delete
@@ -486,7 +515,9 @@ art_pass() {
 }
 
 # Build a case-insensitive find expression from a list of
-# -iname patterns, into FIND_EXPR.
+# -iname patterns, into FIND_EXPR. The caller appends the action
+# it wants (-print0, -printf ...), so a walk can collect metadata
+# in the same pass instead of forking stat per file.
 build_find_expr() {
     local first=1 pat
     FIND_EXPR=(-type f \()
@@ -497,7 +528,7 @@ build_find_expr() {
             FIND_EXPR+=(-o -iname "$pat")
         fi
     done
-    FIND_EXPR+=(\) -print0)
+    FIND_EXPR+=(\))
 }
 
 # Sweep junk files across every root. Its own pass, so it also
@@ -508,7 +539,7 @@ junk_pass() {
     build_find_expr "${JUNK_GLOBS[@]}"
     while IFS= read -r -d '' j; do
         delete_file "$j" "JUNK" "" junk_delete
-    done < <(find "${ROOTS[@]}" "${FIND_EXPR[@]}")
+    done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" "${FIND_EXPR[@]}" -print0)
 }
 
 # Remove empty folders, repeating until nothing more can go so
@@ -520,7 +551,7 @@ empty_prune_pass() {
         while IFS= read -r -d '' d; do
             log "[EMPTY DRY-RUN rmdir] $d"
             empty_prune=$((empty_prune + 1))
-        done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+        done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
         log " NOTE: dry-run lists only folders that are empty RIGHT NOW."
         log "       Parents that become empty once their children are"
         log "       removed are not listed here, but will be removed on"
@@ -534,7 +565,7 @@ empty_prune_pass() {
                     empty_prune=$((empty_prune + 1))
                     pass_removed=$((pass_removed + 1))
                 fi
-            done < <(find "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
+            done < <(find "${FIND_OPTS[@]}" "${ROOTS[@]}" -mindepth 1 -type d -empty -print0)
             [ "$pass_removed" -eq 0 ] && break
         done
     fi
