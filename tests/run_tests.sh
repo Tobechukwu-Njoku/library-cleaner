@@ -708,6 +708,51 @@ fi
 
 
 # =====================================================================
+#  MULTI-EPISODE FILES
+# =====================================================================
+echo
+echo "=== MULTI-EPISODE =================================================="
+rm -rf "$WORK/me"
+ms="$WORK/me/Show/Season 01"
+mkdir -p "$ms"
+head -c 4096 /dev/zero > "$ms/Show - S01E01-E02 - Double.mkv"
+: > "$ms/Show - S01E01.en.srt"
+: > "$ms/Show - S01E02.en.srt"
+# A decoy that must not be read as episodes 1..720.
+head -c 4096 /dev/zero > "$ms/Show - S01E05 - Solo.mkv"
+: > "$ms/Show - S01E05.en.srt"
+
+cat > "$WORK/ov_me" <<OV
+ROOT_DIRS=("$WORK/me")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR=""
+LOCK_FILE=""
+LOG_FILE="$WORK/me.log"
+DELETE_ORPHANS="true"
+DELETE_DUPLICATES="false"
+OV
+gen "$REPO/Library Cleaner TV" "$WORK/me.sh" "$WORK/ov_me"
+"$WORK/me.sh" > "$WORK/me.out" 2>&1
+
+n="$(find "$ms" -name '*.srt' | wc -l)"
+[ "$n" -eq 3 ] \
+    && ok "multi-episode subtitles survive the orphan pass" \
+    || bad "orphan pass destroyed subtitles: $n of 3 left"
+[ -f "$ms/Show - S01E01-E02 - Double.en.srt" ] \
+    && ok "first episode's subtitle renamed onto the double file" \
+    || bad "S01E01 subtitle not renamed"
+[ -f "$ms/Show - S01E05 - Solo.en.srt" ] \
+    && ok "an unrelated single episode is unaffected" \
+    || bad "S01E05 subtitle not renamed"
+# The second episode's subtitle wants the same name as the first, so
+# it is a genuine duplicate. It must be left alone, not deleted.
+grep -q "SUB SKIP exists" "$WORK/me.out" \
+    && ok "second episode's subtitle kept as a collision, not deleted" \
+    || bad "second episode's subtitle was not reported as a collision"
+
+
+# =====================================================================
 #  BUILD FRESHNESS
 #  The scripts at the repo root are generated from src/ by build.sh.
 #  Catch the case where src/ was edited but build.sh was not re-run.

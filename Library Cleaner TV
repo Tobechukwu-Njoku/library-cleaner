@@ -866,15 +866,53 @@ sub_skip_noep=0
 tp_skip_noep=0
 ep_ambig=0
 
-# Extract the first SxxExx token from a name, uppercased.
-# Returns empty string if no token is found.
+# Collect every SxxExx token a name spans, into EP_TOKENS.
+# A multi-episode file covers more than one episode, and naming it
+# by only its first token left the others unclaimed - their
+# subtitles looked orphaned and were deleted.
+#
+#   Show - S01E01 - Title      -> S01E01
+#   Show - S01E01-E02 - Double -> S01E01 S01E02
+#   Show - S01E01E02 - Double  -> S01E01 S01E02
+#   Show - S01E01-03 - Triple  -> S01E01 S01E02 S01E03
+extract_ep_tokens() {
+    local name="$1" season first width tail matched n i tok
+    EP_TOKENS=()
+    [[ "$name" =~ [Ss]([0-9]{1,3})[Ee]([0-9]{1,4}) ]] || return
+    season=$((10#${BASH_REMATCH[1]}))
+    first=$((10#${BASH_REMATCH[2]}))
+    width=${#BASH_REMATCH[2]}
+    printf -v tok 'S%02dE%02d' "$season" "$first"
+    EP_TOKENS+=("$tok")
+
+    # Walk any continuation immediately after the first token. A
+    # leading space ends the scan, so " - 1080p" is never read as
+    # episode 1080.
+    tail="${name#*"${BASH_REMATCH[0]}"}"
+    while [[ "$tail" =~ ^(-?[Ee]|-)([0-9]{1,4}) ]]; do
+        matched="${BASH_REMATCH[0]}"
+        n=$((10#${BASH_REMATCH[2]}))
+        # A bare "-NN" is only a range when it is written like one,
+        # so "S01E01-720p" is not read as episodes 1 to 720.
+        if [ "${BASH_REMATCH[1]}" = "-" ] \
+           && [ "${#BASH_REMATCH[2]}" -ne "$width" ]; then
+            break
+        fi
+        [ "$n" -gt "$first" ] || break
+        [ $((n - first)) -le 50 ] || break
+        for ((i = first + 1; i <= n; i++)); do
+            printf -v tok 'S%02dE%02d' "$season" "$i"
+            EP_TOKENS+=("$tok")
+        done
+        first="$n"
+        tail="${tail#"$matched"}"
+    done
+}
+
+# The first token only - what a subtitle or trickplay folder names.
 extract_ep_token() {
-    local name="$1"
-    if [[ "$name" =~ [Ss]([0-9]{1,3})[Ee]([0-9]{1,4}) ]]; then
-        printf 'S%sE%s' \
-            "$(printf '%02d' "$((10#${BASH_REMATCH[1]}))")" \
-            "$(printf '%02d' "$((10#${BASH_REMATCH[2]}))")"
-    fi
+    extract_ep_tokens "$1"
+    [ "${#EP_TOKENS[@]}" -gt 0 ] && printf '%s' "${EP_TOKENS[0]}"
 }
 
 # ---------- Discover season folders -------------------------
@@ -904,14 +942,16 @@ for season in "${season_folders[@]}"; do
     for ext in "${VIDEO_EXTS[@]}"; do
         for v in "$season"/*."$ext"; do
             [ -f "$v" ] || continue
-            tok="$(extract_ep_token "${v##*/}")"
-            [ -z "$tok" ] && continue
-            if [ -n "${EP_VIDEO[$tok]:-}" ]; then
-                EP_DUP["$tok"]=1
-                log "[EP DUPLICATE] $tok in $season"
-            else
-                EP_VIDEO["$tok"]="$v"
-            fi
+            extract_ep_tokens "${v##*/}"
+            [ "${#EP_TOKENS[@]}" -eq 0 ] && continue
+            for tok in "${EP_TOKENS[@]}"; do
+                if [ -n "${EP_VIDEO[$tok]:-}" ]; then
+                    EP_DUP["$tok"]=1
+                    log "[EP DUPLICATE] $tok in $season"
+                else
+                    EP_VIDEO["$tok"]="$v"
+                fi
+            done
         done
     done
     shopt -u nullglob nocaseglob
