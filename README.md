@@ -49,6 +49,7 @@ deleted in a dry run.
 | `DRY_RUN` | `"true"` logs what would happen and changes nothing. |
 | `ENABLE_LOG` | `"false"` silences all output. The script still does the work. |
 | `LOG_FILE` | Appended to each run. Renamers only — `NFO Cleaner` prints to stdout, which User Scripts captures per run. |
+| `TRASH_DIR` | Safety net. When set, files the destructive passes would remove are **moved** here instead, under a timestamped folder mirroring their original path, so a bad run can be undone. Set to `""` to delete outright. The script refuses to start if this sits inside a root. |
 
 ### Renamers
 
@@ -60,6 +61,10 @@ deleted in a dry run.
 | `STRIP_HI` | Drop a trailing `.hi` — but only when another component precedes it, so a lone `.hi` (possibly Hindi) survives. |
 | `RESPECT_EXTRA_SUBS` | **Film only, default `"true"`.** A subtitle whose name (minus its language suffix) matches a *different* video in the folder is left alone. Without it, `Film-behindthescenes.en.srt` is renamed onto the feature film and lost. |
 | `SEASON_DIR_REGEX` | **TV only.** Which subfolders count as season folders. Empty string scans every subfolder. |
+| `EXTRA_LANG_CODES` | Extra language codes beyond the built-in ISO 639-1 and 639-2 sets. Only whitelisted codes are treated as languages, so release tags like `WEB`, `DDP` and `HDR` are not mistaken for one. |
+| `DUPLICATE_KEEP` | Which file survives when a rename target already exists and `DELETE_DUPLICATES` is on: `largest` (default) or `existing`. A rename keeps the subtitle's extension, so a collision is always between two files of the same format. |
+| `FOLLOW_SYMLINKS` | Pass `-L` to `find` so symlinked roots and subfolders are walked. Off by default — see below. |
+| `LOCK_FILE` | Non-blocking `flock`, so a scheduled run that overruns its interval can't have a second copy renaming the same folders. Set to `""` to disable. |
 
 ### Destructive options (all default `"false"`)
 
@@ -76,6 +81,25 @@ deleted in a dry run.
 > `PRUNE_EMPTY_DIRS` in a dry run can only list folders that are empty *at that
 > moment*. Parents that empty out once their children are removed aren't listed,
 > but will be removed on a real run.
+
+With `TRASH_DIR` set — which is the default — none of these actually delete
+anything. Files are moved into the trash folder and can be moved back. Empty
+the trash yourself once you're satisfied with a run.
+
+## First live run
+
+Sixteen roots is a lot of blast radius for a first real run, so widen into it:
+
+1. Dry-run with everything destructive off, and read the log.
+2. Point `ROOT_DIRS` at **one** root — prefer an `MN` or `OF` one over a
+   release-group one, since scene-named files exercise more edge cases — and run
+   it live with the destructive flags still off. Confirm Jellyfin still resolves
+   subtitles and artwork for a few titles.
+3. Turn on one destructive flag at a time, dry-run first, then live.
+4. Only then restore the full `ROOT_DIRS` list.
+
+Check `TRASH_DIR` after each live run. It's the record of everything that was
+removed, and it's the thing you'd restore from.
 
 ## Supported layouts
 
@@ -99,27 +123,34 @@ the first token.
 
 **NFO Cleaner** — layout-agnostic.
 
-## Symlinked paths are silently skipped
+## Symlinked paths
 
-`find` is not told to follow symbolic links, so **a symlinked library path is
-walked as a link rather than a directory and yields nothing**. A symlinked root
-is especially misleading: it passes the existence check, gets logged as a valid
-root, and the script then reports a successful run having done no work at all.
-Symlinked *subdirectories* inside a real root are skipped the same way, without
-any message.
+By default `find` is not told to follow symbolic links, so **a symlinked library
+path is walked as a link rather than a directory and yields nothing**. A
+symlinked root used to be especially misleading: it passes the existence check,
+gets logged as a valid root, and the script then reports a successful run having
+done no work at all. That case is now reported —
 
-Hardlinks — what Radarr and Sonarr normally create — are unaffected. This is
-only about symlinks.
+```
+ WARNING: that root is a symlink and FOLLOW_SYMLINKS
+          is "false", so it will yield nothing.
+```
 
-If a root is a symlink, either point `ROOT_DIRS` at the real path:
+— but symlinked *subdirectories* inside a real root are still skipped without a
+message, since finding them would mean walking the tree twice.
+
+Two ways to handle it: point `ROOT_DIRS` at the real path,
 
 ```bash
 readlink -f "/mnt/user/Media-Large/Films"
 ```
 
-or add `-L` to the `find` calls so links are followed. If you do that, be aware
-that `-L` can revisit the same files through several paths, and that a symlink
-loop will make `find` complain.
+or set `FOLLOW_SYMLINKS="true"`. Following links means `find` can reach the same
+file by several paths, and a symlink loop will make it error out, so prefer the
+real path where you know it.
+
+Hardlinks — what Radarr and Sonarr normally create — are unaffected. This is
+only about symlinks.
 
 ## Development
 
