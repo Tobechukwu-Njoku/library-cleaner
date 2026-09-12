@@ -122,6 +122,7 @@ duplicate_delete=0
 art_outlier_delete=0
 junk_delete=0
 empty_prune=0
+trash_pruned=0
 error_count=0
 
 # Extra summary lines contributed by the calling script, each
@@ -772,6 +773,49 @@ empty_prune_pass() {
     fi
 }
 
+# Remove quarantined runs older than TRASH_KEEP_DAYS. The age comes
+# from the folder's own timestamp name rather than its mtime, which
+# shifts as files are added. Only folders named like a run
+# timestamp are touched, so anything else under TRASH_DIR survives.
+trash_prune_pass() {
+    local d name ts epoch now cutoff age
+    [ -z "$TRASH_DIR" ] && return 0
+    [[ "${TRASH_KEEP_DAYS:-0}" =~ ^[0-9]+$ ]] || return 0
+    [ "$TRASH_KEEP_DAYS" -eq 0 ] && return 0
+    [ -d "$TRASH_DIR" ] || return 0
+
+    log " ---- Trash retention pass (keeping $TRASH_KEEP_DAYS days) ----"
+    now="$(date +%s)"
+    cutoff=$(( TRASH_KEEP_DAYS * 86400 ))
+
+    shopt -s nullglob
+    for d in "$TRASH_DIR"/*/; do
+        d="${d%/}"
+        name="${d##*/}"
+        [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] \
+            || continue
+        ts="${name:0:10} ${name:11:2}:${name:14:2}:${name:17:2}"
+        epoch="$(date -d "$ts" +%s 2>/dev/null)" || continue
+        [ -z "$epoch" ] && continue
+        age=$(( now - epoch ))
+        [ "$age" -gt "$cutoff" ] || continue
+
+        if [ "$DRY_RUN" = "true" ]; then
+            log "[TRASH DRY-RUN prune] $d"
+            trash_pruned=$((trash_pruned + 1))
+        else
+            if rm -rf -- "$d"; then
+                log "[TRASH PRUNED] $d"
+                trash_pruned=$((trash_pruned + 1))
+            else
+                log "[TRASH ERROR] could not prune: $d"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done
+    shopt -u nullglob
+}
+
 # Log one "label value" summary line, phrased for dry-run or not.
 summary_line() {
     local label="$1" value="$2"
@@ -847,6 +891,13 @@ print_summary() {
             summary_line "Empty folders would remove:" "$empty_prune"
         else
             summary_line "Empty folders removed:" "$empty_prune"
+        fi
+    fi
+    if [ "$trash_pruned" -gt 0 ]; then
+        if [ "$DRY_RUN" = "true" ]; then
+            summary_line "Old trash runs would prune:" "$trash_pruned"
+        else
+            summary_line "Old trash runs pruned:" "$trash_pruned"
         fi
     fi
     summary_line "Errors:" "$error_count"

@@ -223,6 +223,14 @@ SUBS_SUBFOLDERS=(Subs Subtitles Subtitle)
 # is and logged, never deleted.
 PROMOTE_SUBS_FOLDER="true"
 
+# How long to keep quarantined files. Run folders under TRASH_DIR
+# older than this many days are removed at the end of a run, so the
+# safety net doesn't grow without bound. Set to 0 to keep
+# everything and empty it yourself. Ignored when TRASH_DIR is "".
+# Only folders named like a run timestamp are ever considered, so
+# anything else you put under TRASH_DIR is left alone.
+TRASH_KEEP_DAYS="30"
+
 # --------------------- END CONFIGURATION --------------------
 
 SCRIPT_TITLE="Library Cleaner - Film"
@@ -364,6 +372,9 @@ fi
 
 [ "$DELETE_JUNK" = "true" ] && junk_pass
 [ "$PRUNE_EMPTY_DIRS" = "true" ] && empty_prune_pass
+
+# Last, so anything quarantined by this run is already in place.
+trash_prune_pass
 
 UNIT_COUNT="$folder_count"
 if [ "$RESPECT_EXTRA_SUBS" = "true" ]; then

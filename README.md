@@ -50,6 +50,7 @@ deleted in a dry run.
 | `ENABLE_LOG` | `"false"` silences all output. The script still does the work. |
 | `LOG_FILE` | Appended to each run. Renamers only — `NFO Cleaner` prints to stdout, which User Scripts captures per run. |
 | `TRASH_DIR` | Safety net. When set, files the destructive passes would remove are **moved** here instead, under a timestamped folder mirroring their original path, so a bad run can be undone. Set to `""` to delete outright. The script refuses to start if this sits inside a root. |
+| `TRASH_KEEP_DAYS` | How long quarantined runs are kept. Older run folders are pruned at the end of a run so the trash doesn't grow without bound; `0` keeps everything. Only folders named like a run timestamp are ever removed. |
 
 ### Renamers
 
@@ -85,8 +86,9 @@ deleted in a dry run.
 > but will be removed on a real run.
 
 With `TRASH_DIR` set — which is the default — none of these actually delete
-anything. Files are moved into the trash folder and can be moved back. Empty
-the trash yourself once you're satisfied with a run.
+anything. Files are moved into the trash folder and can be moved back, and runs
+older than `TRASH_KEEP_DAYS` are pruned automatically at the end of a later run.
+Restore anything you want to keep before that window closes.
 
 ## First live run
 
@@ -101,16 +103,27 @@ Sixteen roots is a lot of blast radius for a first real run, so widen into it:
 4. Only then restore the full `ROOT_DIRS` list.
 
 Check `TRASH_DIR` after each live run. It's the record of everything that was
-removed, and it's the thing you'd restore from.
+removed, and it's the thing you'd restore from — but it's pruned on a
+`TRASH_KEEP_DAYS` window, so don't treat it as an archive.
 
 ## Supported layouts
 
 **Film** — one folder per movie, at any depth under a root. `Films/Film (2020)/`
 and `Films/4K/Film (2020)/` both work.
 
-> ⚠️ Do not point the film script at a **flat** folder of loose movie files.
-> Every video becomes one group, the largest wins, and every subtitle in that
-> folder is renamed onto it.
+> ⚠️ Prefer one folder per movie. In a **flat** folder of loose films the whole
+> folder is treated as a single group and the largest file is taken as the
+> feature. `RESPECT_EXTRA_SUBS` (on by default) then protects every subtitle
+> whose name matches one of the videos, so a tidily-named flat folder mostly
+> survives — but a subtitle matching *no* video is renamed onto the largest
+> film, which in a flat folder means it lands on the wrong one:
+>
+> ```
+> Film A (2020).en.srt   kept          matches Film A (2020).mkv
+> Film B (2021).en.srt   kept          matches Film B (2021).mkv
+> Film C (2022).fr.srt   kept          matches Film C (2022).mkv
+> Film.C.2022.WEB.srt    -> Film A (2020).srt    matched nothing
+> ```
 
 **TV** — strictly `<ROOT>/<Show>/<Season NN>/`. Season folders must match
 `SEASON_DIR_REGEX`, which by default accepts `Season 01`, `Season01`, `Season_1`,

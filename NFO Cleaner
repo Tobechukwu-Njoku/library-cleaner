@@ -39,6 +39,11 @@ ENABLE_LOG="true"
 # per-file work. Must not sit inside any of ROOT_DIRS.
 TRASH_DIR="/mnt/user/appdata/library_cleaner/trash"
 
+# How long to keep quarantined files. Run folders under TRASH_DIR
+# older than this many days are removed at the end of a run. Set to
+# 0 to keep everything. Ignored when TRASH_DIR is "".
+TRASH_KEEP_DAYS="30"
+
 # --------------------- END CONFIGURATION --------------------
 
 set -uo pipefail
@@ -71,6 +76,35 @@ if [ -n "$TRASH_DIR" ]; then
         esac
     done
 fi
+
+# Remove quarantined runs older than TRASH_KEEP_DAYS. Age comes
+# from the folder's timestamp name, and only folders named like one
+# are ever touched.
+trash_prune() {
+    local d name ts epoch now cutoff
+    [ -z "$TRASH_DIR" ] && return 0
+    [[ "${TRASH_KEEP_DAYS:-0}" =~ ^[0-9]+$ ]] || return 0
+    [ "$TRASH_KEEP_DAYS" -eq 0 ] && return 0
+    [ -d "$TRASH_DIR" ] || return 0
+
+    now="$(date +%s)"
+    cutoff=$(( TRASH_KEEP_DAYS * 86400 ))
+    shopt -s nullglob
+    for d in "$TRASH_DIR"/*/; do
+        d="${d%/}"
+        name="${d##*/}"
+        [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] \
+            || continue
+        ts="${name:0:10} ${name:11:2}:${name:14:2}:${name:17:2}"
+        epoch="$(date -d "$ts" +%s 2>/dev/null)" || continue
+        [ -z "$epoch" ] && continue
+        [ $(( now - epoch )) -gt "$cutoff" ] || continue
+        if rm -rf -- "$d"; then
+            [ "$ENABLE_LOG" = "true" ] && echo " Pruned old trash run: $d"
+        fi
+    done
+    shopt -u nullglob
+}
 
 # Case-insensitive match on both extensions.
 match=( \( -iname '*.nfo' -o -iname '*.nfo-orig' \) )
@@ -119,6 +153,7 @@ if [ "$ENABLE_LOG" = "true" ]; then
         fi
     fi
 
+    [ "$DRY_RUN" = "true" ] || trash_prune
     echo " Finished: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "=========================================================="
 else
@@ -131,6 +166,7 @@ else
         echo "Dry-run: $count file(s) would be deleted."
     elif [ -n "$TRASH_DIR" ]; then
         trash_matches >/dev/null
+        trash_prune
     else
         find "${ROOTS[@]}" -type f "${match[@]}" -delete
     fi

@@ -958,6 +958,83 @@ fi
 
 
 # =====================================================================
+#  TRASH RETENTION
+# =====================================================================
+echo
+echo "=== TRASH RETENTION ================================================"
+retention_fixture() {
+    rm -rf "$WORK/rt" "$WORK/rttrash"
+    mkdir -p "$WORK/rt/Film A (2020)"
+    head -c 4096 /dev/zero > "$WORK/rt/Film A (2020)/Film A (2020)-Radarr.mkv"
+    # Old run, recent run, and something that is not a run folder.
+    mkdir -p "$WORK/rttrash/2020-01-01_00-00-00/mnt/old"
+    : > "$WORK/rttrash/2020-01-01_00-00-00/mnt/old/ancient.srt"
+    mkdir -p "$WORK/rttrash/$(date '+%Y-%m-%d_%H-%M-%S')/mnt/new"
+    mkdir -p "$WORK/rttrash/my-own-notes"
+    : > "$WORK/rttrash/my-own-notes/keep-me.txt"
+}
+
+retention_fixture
+cat > "$WORK/ov_rt" <<OV
+ROOT_DIRS=("$WORK/rt")
+DRY_RUN="false"
+ENABLE_LOG="true"
+LOG_FILE="$WORK/rt.log"
+LOCK_FILE=""
+TRASH_DIR="$WORK/rttrash"
+TRASH_KEEP_DAYS="30"
+OV
+gen "$REPO/Library Cleaner Film" "$WORK/rt.sh" "$WORK/ov_rt"
+"$WORK/rt.sh" > "$WORK/rt.out" 2>&1
+
+[ ! -d "$WORK/rttrash/2020-01-01_00-00-00" ] \
+    && ok "trash run older than the retention window is pruned" \
+    || bad "old trash run survived"
+[ -n "$(find "$WORK/rttrash" -maxdepth 1 -name "$(date '+%Y')-*" -type d | head -1)" ] \
+    && ok "recent trash run is kept" || bad "recent trash run was pruned"
+[ -f "$WORK/rttrash/my-own-notes/keep-me.txt" ] \
+    && ok "a folder that isn't a run timestamp is left alone" \
+    || bad "pruned a folder it should not have touched"
+grep -q "Old trash runs pruned:" "$WORK/rt.out" \
+    && ok "summary reports the pruning" || bad "summary omits pruning"
+
+# Dry runs prune nothing.
+retention_fixture
+sed 's|^DRY_RUN="false"$|DRY_RUN="true"|' "$WORK/ov_rt" > "$WORK/ov_rt2"
+gen "$REPO/Library Cleaner Film" "$WORK/rt2.sh" "$WORK/ov_rt2"
+"$WORK/rt2.sh" > "$WORK/rt2.out" 2>&1
+[ -d "$WORK/rttrash/2020-01-01_00-00-00" ] \
+    && ok "dry run prunes nothing" || bad "dry run pruned the trash"
+grep -q "TRASH DRY-RUN prune" "$WORK/rt2.out" \
+    && ok "dry run still reports what it would prune" \
+    || bad "dry run did not report prunable runs"
+
+# 0 disables retention entirely.
+retention_fixture
+sed 's|^TRASH_KEEP_DAYS=.*|TRASH_KEEP_DAYS="0"|' "$WORK/ov_rt" > "$WORK/ov_rt3"
+gen "$REPO/Library Cleaner Film" "$WORK/rt3.sh" "$WORK/ov_rt3"
+"$WORK/rt3.sh" > /dev/null 2>&1
+[ -d "$WORK/rttrash/2020-01-01_00-00-00" ] \
+    && ok "TRASH_KEEP_DAYS=0 keeps everything" || bad "pruned despite being disabled"
+
+# NFO Cleaner honours it too.
+retention_fixture
+: > "$WORK/rt/Film A (2020)/stale.nfo"
+cat > "$WORK/ov_rtn" <<OV
+ROOT_DIRS=("$WORK/rt")
+DRY_RUN="false"
+ENABLE_LOG="true"
+TRASH_DIR="$WORK/rttrash"
+TRASH_KEEP_DAYS="30"
+OV
+gen "$REPO/NFO Cleaner" "$WORK/rtn.sh" "$WORK/ov_rtn"
+"$WORK/rtn.sh" > "$WORK/rtn.out" 2>&1
+[ ! -d "$WORK/rttrash/2020-01-01_00-00-00" ] \
+    && ok "nfo cleaner prunes old trash runs too" \
+    || bad "nfo cleaner did not prune"
+
+
+# =====================================================================
 #  BUILD FRESHNESS
 #  The scripts at the repo root are generated from src/ by build.sh.
 #  Catch the case where src/ was edited but build.sh was not re-run.
