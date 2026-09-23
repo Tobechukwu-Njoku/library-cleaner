@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same container the suite runs in locally, so CI and a Mac agree.
+      # It also fails if a generated script is stale against src/.
+      - name: Run test suite
+        run: ./tests/docker-run.sh

@@ -1,5 +1,7 @@
 # Library Cleaner
 
+[![Tests](https://github.com/Tobechukwu-Njoku/library-cleaner/actions/workflows/test.yml/badge.svg)](https://github.com/Tobechukwu-Njoku/library-cleaner/actions/workflows/test.yml)
+
 Three Bash scripts for [Unraid User Scripts](https://forums.unraid.net/topic/48286-plugin-ca-user-scripts/)
 that tidy up a Radarr/Sonarr media library so Jellyfin, Emby and Kodi pick
 everything up correctly.
