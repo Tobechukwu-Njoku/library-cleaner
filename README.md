@@ -1,3 +1,6 @@
+> **This repository has moved** to [Tobechukwu-Njoku/Unraid › user-scripts/library-cleaner](https://github.com/Tobechukwu-Njoku/Unraid/tree/main/user-scripts/library-cleaner),
+> where it lives alongside my other Unraid code, with its full history. This copy is archived and won't be updated.
+
 # Library Cleaner
 
 [![Tests](https://github.com/Tobechukwu-Njoku/library-cleaner/actions/workflows/test.yml/badge.svg)](https://github.com/Tobechukwu-Njoku/library-cleaner/actions/workflows/test.yml)
